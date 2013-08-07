@@ -319,8 +319,34 @@ public class RawLocalFileSystem extends FileSystem {
 
   @Override
   public boolean rename(Path src, Path dst) throws IOException {
-    if (pathToFile(src).renameTo(pathToFile(dst))) {
+    // Attempt rename using Java API.
+    File srcFile = pathToFile(src);
+    File dstFile = pathToFile(dst);
+    if (srcFile.renameTo(dstFile)) {
       return true;
+    }
+
+    // Enforce POSIX rename behavior that a source directory replaces an existing
+    // destination if the destination is an empty directory.  On most platforms,
+    // this is already handled by the Java API call above.  Some platforms
+    // (notably Windows) do not provide this behavior, so the Java API call above
+    // fails.  Delete destination and attempt rename again.
+    if (this.exists(dst)) {
+      FileStatus sdst = this.getFileStatus(dst);
+      if (sdst.isDirectory() && dstFile.list().length == 0) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Deleting empty destination and renaming " + src + " to " +
+            dst);
+        }
+        if (this.delete(dst, false) && srcFile.renameTo(dstFile)) {
+          return true;
+        }
+      }
+    }
+
+    // The fallback behavior accomplishes the rename by a full copy.
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Falling through to a copy of " + src + " to " + dst);
     }
     return FileUtil.copy(this, src, this, dst, true, getConf());
   }
@@ -437,7 +463,6 @@ public class RawLocalFileSystem extends FileSystem {
   public void setWorkingDirectory(Path newDir) {
     workingDir = makeAbsolute(newDir);
     checkPath(workingDir);
-    
   }
   
   @Override
@@ -641,4 +666,91 @@ public class RawLocalFileSystem extends FileSystem {
     }
   }
 
+  @Override
+  public boolean supportsSymlinks() {
+    return true;
+  }
+
+  @Override
+  public void createSymlink(Path target, Path link, boolean createParent)
+      throws IOException {
+    final String targetScheme = target.toUri().getScheme();
+    if (targetScheme != null && !"file".equals(targetScheme)) {
+      throw new IOException("Unable to create symlink to non-local file "+
+                            "system: "+target.toString());
+    }
+    if (createParent) {
+      mkdirs(link.getParent());
+    }
+
+    // NB: Use createSymbolicLink in java.nio.file.Path once available
+    int result = FileUtil.symLink(target.toString(),
+        makeAbsolute(link).toString());
+    if (result != 0) {
+      throw new IOException("Error " + result + " creating symlink " +
+          link + " to " + target);
+    }
+  }
+
+  /**
+   * Return a FileStatus representing the given path. If the path refers
+   * to a symlink return a FileStatus representing the link rather than
+   * the object the link refers to.
+   */
+  @Override
+  public FileStatus getFileLinkStatus(final Path f) throws IOException {
+    FileStatus fi = getFileLinkStatusInternal(f);
+    // getFileLinkStatus is supposed to return a symlink with a
+    // qualified path
+    if (fi.isSymlink()) {
+      Path targetQual = FSLinkResolver.qualifySymlinkTarget(this.getUri(),
+          fi.getPath(), fi.getSymlink());
+      fi.setSymlink(targetQual);
+    }
+    return fi;
+  }
+
+  private FileStatus getFileLinkStatusInternal(final Path f) throws IOException {
+    String target = FileUtil.readLink(new File(f.toString()));
+
+    try {
+      FileStatus fs = getFileStatus(f);
+      // If f refers to a regular file or directory
+      if (target.isEmpty()) {
+        return fs;
+      }
+      // Otherwise f refers to a symlink
+      return new FileStatus(fs.getLen(),
+          false,
+          fs.getReplication(),
+          fs.getBlockSize(),
+          fs.getModificationTime(),
+          fs.getAccessTime(),
+          fs.getPermission(),
+          fs.getOwner(),
+          fs.getGroup(),
+          new Path(target),
+          f);
+    } catch (FileNotFoundException e) {
+      /* The exists method in the File class returns false for dangling
+       * links so we can get a FileNotFoundException for links that exist.
+       * It's also possible that we raced with a delete of the link. Use
+       * the readBasicFileAttributes method in java.nio.file.attributes
+       * when available.
+       */
+      if (!target.isEmpty()) {
+        return new FileStatus(0, false, 0, 0, 0, 0, FsPermission.getDefault(),
+            "", "", new Path(target), f);
+      }
+      // f refers to a file or directory that does not exist
+      throw e;
+    }
+  }
+
+  @Override
+  public Path getLinkTarget(Path f) throws IOException {
+    FileStatus fi = getFileLinkStatusInternal(f);
+    // return an unqualified symlink target
+    return fi.getSymlink();
+  }
 }

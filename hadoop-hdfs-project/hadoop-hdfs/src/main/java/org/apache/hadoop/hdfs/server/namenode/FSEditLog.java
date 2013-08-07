@@ -61,7 +61,6 @@ import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.RenameOldOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.RenameOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.RenameSnapshotOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.RenewDelegationTokenOp;
-import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetGenstampOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetOwnerOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetPermissionsOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetQuotaOp;
@@ -70,12 +69,16 @@ import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SymlinkOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.TimesOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.UpdateBlocksOp;
 import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.UpdateMasterKeyOp;
+import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.AllocateBlockIdOp;
+import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetGenstampV1Op;
+import org.apache.hadoop.hdfs.server.namenode.FSEditLogOp.SetGenstampV2Op;
 import org.apache.hadoop.hdfs.server.namenode.JournalSet.JournalAndStream;
 import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
 import org.apache.hadoop.hdfs.server.protocol.NamenodeRegistration;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.security.token.delegation.DelegationKey;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -659,11 +662,20 @@ public class FSEditLog implements LogsPurgeable {
     LOG.info(buf);
   }
 
+  /** Record the RPC IDs if necessary */
+  private void logRpcIds(FSEditLogOp op, boolean toLogRpcIds) {
+    if (toLogRpcIds) {
+      op.setRpcClientId(Server.getClientId());
+      op.setRpcCallId(Server.getCallId());
+    }
+  }
+  
   /** 
    * Add open lease record to edit log. 
    * Records the block locations of the last block.
    */
-  public void logOpenFile(String path, INodeFileUnderConstruction newNode) {
+  public void logOpenFile(String path, INodeFileUnderConstruction newNode,
+      boolean toLogRpcIds) {
     AddOp op = AddOp.getInstance(cache.get())
       .setInodeId(newNode.getId())
       .setPath(path)
@@ -675,8 +687,8 @@ public class FSEditLog implements LogsPurgeable {
       .setPermissionStatus(newNode.getPermissionStatus())
       .setClientName(newNode.getClientName())
       .setClientMachine(newNode.getClientMachine());
-    
-      logEdit(op);
+    logRpcIds(op, toLogRpcIds);
+    logEdit(op);
   }
 
   /** 
@@ -695,10 +707,12 @@ public class FSEditLog implements LogsPurgeable {
     logEdit(op);
   }
   
-  public void logUpdateBlocks(String path, INodeFileUnderConstruction file) {
+  public void logUpdateBlocks(String path, INodeFileUnderConstruction file,
+      boolean toLogRpcIds) {
     UpdateBlocksOp op = UpdateBlocksOp.getInstance(cache.get())
       .setPath(path)
       .setBlocks(file.getBlocks());
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
@@ -718,23 +732,26 @@ public class FSEditLog implements LogsPurgeable {
    * Add rename record to edit log
    * TODO: use String parameters until just before writing to disk
    */
-  void logRename(String src, String dst, long timestamp) {
+  void logRename(String src, String dst, long timestamp, boolean toLogRpcIds) {
     RenameOldOp op = RenameOldOp.getInstance(cache.get())
       .setSource(src)
       .setDestination(dst)
       .setTimestamp(timestamp);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
   /** 
    * Add rename record to edit log
    */
-  void logRename(String src, String dst, long timestamp, Options.Rename... options) {
+  void logRename(String src, String dst, long timestamp, boolean toLogRpcIds,
+      Options.Rename... options) {
     RenameOp op = RenameOp.getInstance(cache.get())
       .setSource(src)
       .setDestination(dst)
       .setTimestamp(timestamp)
       .setOptions(options);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
@@ -781,30 +798,50 @@ public class FSEditLog implements LogsPurgeable {
   /**
    * concat(trg,src..) log
    */
-  void logConcat(String trg, String [] srcs, long timestamp) {
+  void logConcat(String trg, String[] srcs, long timestamp, boolean toLogRpcIds) {
     ConcatDeleteOp op = ConcatDeleteOp.getInstance(cache.get())
       .setTarget(trg)
       .setSources(srcs)
       .setTimestamp(timestamp);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
   /** 
    * Add delete file record to edit log
    */
-  void logDelete(String src, long timestamp) {
+  void logDelete(String src, long timestamp, boolean toLogRpcIds) {
     DeleteOp op = DeleteOp.getInstance(cache.get())
       .setPath(src)
       .setTimestamp(timestamp);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
 
-  /** 
+  /**
+   * Add legacy block generation stamp record to edit log
+   */
+  void logGenerationStampV1(long genstamp) {
+    SetGenstampV1Op op = SetGenstampV1Op.getInstance(cache.get())
+        .setGenerationStamp(genstamp);
+    logEdit(op);
+  }
+
+  /**
    * Add generation stamp record to edit log
    */
-  void logGenerationStamp(long genstamp) {
-    SetGenstampOp op = SetGenstampOp.getInstance(cache.get())
-      .setGenerationStamp(genstamp);
+  void logGenerationStampV2(long genstamp) {
+    SetGenstampV2Op op = SetGenstampV2Op.getInstance(cache.get())
+        .setGenerationStamp(genstamp);
+    logEdit(op);
+  }
+
+  /**
+   * Record a newly allocated block ID in the edit log
+   */
+  void logAllocateBlockId(long blockId) {
+    AllocateBlockIdOp op = AllocateBlockIdOp.getInstance(cache.get())
+      .setBlockId(blockId);
     logEdit(op);
   }
 
@@ -822,8 +859,8 @@ public class FSEditLog implements LogsPurgeable {
   /** 
    * Add a create symlink record.
    */
-  void logSymlink(String path, String value, long mtime, 
-                  long atime, INodeSymlink node) {
+  void logSymlink(String path, String value, long mtime, long atime,
+      INodeSymlink node, boolean toLogRpcIds) {
     SymlinkOp op = SymlinkOp.getInstance(cache.get())
       .setId(node.getId())
       .setPath(path)
@@ -831,6 +868,7 @@ public class FSEditLog implements LogsPurgeable {
       .setModificationTime(mtime)
       .setAccessTime(atime)
       .setPermissionStatus(node.getPermissionStatus());
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
@@ -875,22 +913,26 @@ public class FSEditLog implements LogsPurgeable {
     logEdit(op);
   }
   
-  void logCreateSnapshot(String snapRoot, String snapName) {
+  void logCreateSnapshot(String snapRoot, String snapName, boolean toLogRpcIds) {
     CreateSnapshotOp op = CreateSnapshotOp.getInstance(cache.get())
         .setSnapshotRoot(snapRoot).setSnapshotName(snapName);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
-  void logDeleteSnapshot(String snapRoot, String snapName) {
+  void logDeleteSnapshot(String snapRoot, String snapName, boolean toLogRpcIds) {
     DeleteSnapshotOp op = DeleteSnapshotOp.getInstance(cache.get())
         .setSnapshotRoot(snapRoot).setSnapshotName(snapName);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   
-  void logRenameSnapshot(String path, String snapOldName, String snapNewName) {
+  void logRenameSnapshot(String path, String snapOldName, String snapNewName,
+      boolean toLogRpcIds) {
     RenameSnapshotOp op = RenameSnapshotOp.getInstance(cache.get())
         .setSnapshotRoot(path).setSnapshotOldName(snapOldName)
         .setSnapshotNewName(snapNewName);
+    logRpcIds(op, toLogRpcIds);
     logEdit(op);
   }
   

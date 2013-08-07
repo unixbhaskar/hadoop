@@ -123,6 +123,12 @@ abstract public class Shell {
                    : new String[] { "ln", "-s", target, link };
   }
 
+  /** Return a command to read the target of the a symbolic link*/
+  public static String[] getReadlinkCommand(String link) {
+    return WINDOWS ? new String[] { WINUTILS, "readlink", link }
+        : new String[] { "readlink", link };
+  }
+
   /** Return a command for determining if process with specified pid is alive. */
   public static String[] getCheckProcessIsAliveCommand(String pid) {
     return Shell.WINDOWS ?
@@ -136,6 +142,12 @@ abstract public class Shell {
       new String[] { "kill", "-" + code, isSetsidAvailable ? "-" + pid : pid };
   }
 
+  /** Return a regular expression string that match environment variables */
+  public static String getEnvironmentVariableRegex() {
+    return (WINDOWS) ? "%([A-Za-z_][A-Za-z0-9_]*?)%" :
+      "\\$([A-Za-z_][A-Za-z0-9_]*)";
+  }
+  
   /**
    * Returns a File referencing a script with the given basename, inside the
    * given parent directory.  The file extension is inferred by platform: ".cmd"

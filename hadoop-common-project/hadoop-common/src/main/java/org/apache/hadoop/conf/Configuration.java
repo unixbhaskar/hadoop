@@ -2181,12 +2181,12 @@ public class Configuration implements Iterable<Map.Entry<String,String>>,
 
   /** 
    * Write out the non-default properties in this configuration to the given
-   * {@link OutputStream}.
+   * {@link OutputStream} using UTF-8 encoding.
    * 
    * @param out the output stream to write to.
    */
   public void writeXml(OutputStream out) throws IOException {
-    writeXml(new OutputStreamWriter(out));
+    writeXml(new OutputStreamWriter(out, "UTF-8"));
   }
 
   /** 
@@ -2228,7 +2228,7 @@ public class Configuration implements Iterable<Map.Entry<String,String>>,
     doc.appendChild(conf);
     conf.appendChild(doc.createTextNode("\n"));
     handleDeprecation(); //ensure properties is set and deprecation is handled
-    for (Enumeration e = properties.keys(); e.hasMoreElements();) {
+    for (Enumeration<Object> e = properties.keys(); e.hasMoreElements();) {
       String name = (String)e.nextElement();
       Object object = properties.get(name);
       String value = null;

@@ -204,35 +204,36 @@ public class HarFileSystem extends FilterFileSystem {
       //create a path 
       return FileSystem.getDefaultUri(conf);
     }
-    String host = rawURI.getHost();
-    if (host == null) {
+    String authority = rawURI.getAuthority();
+    if (authority == null) {
       throw new IOException("URI: " + rawURI
-          + " is an invalid Har URI since host==null."
+          + " is an invalid Har URI since authority==null."
           + "  Expecting har://<scheme>-<host>/<path>.");
     }
-    int i = host.indexOf('-');
+ 
+    int i = authority.indexOf('-');
     if (i < 0) {
       throw new IOException("URI: " + rawURI
           + " is an invalid Har URI since '-' not found."
           + "  Expecting har://<scheme>-<host>/<path>.");
     }
-    final String underLyingScheme = host.substring(0, i);
-    i++;
-    final String underLyingHost = i == host.length()? null: host.substring(i);
-    int underLyingPort = rawURI.getPort();
-    String auth = (underLyingHost == null && underLyingPort == -1)?
-                  null:(underLyingHost+
-                      (underLyingPort == -1 ? "" : ":"+underLyingPort));
-    URI tmp = null;
+ 
     if (rawURI.getQuery() != null) {
       // query component not allowed
       throw new IOException("query component in Path not supported  " + rawURI);
     }
+ 
+    URI tmp = null;
+ 
     try {
-      tmp = new URI(underLyingScheme, auth, rawURI.getPath(), 
-            rawURI.getQuery(), rawURI.getFragment());
+      // convert <scheme>-<host> to <scheme>://<host>
+      URI baseUri = new URI(authority.replaceFirst("-", "://"));
+ 
+      tmp = new URI(baseUri.getScheme(), baseUri.getAuthority(),
+            rawURI.getPath(), rawURI.getQuery(), rawURI.getFragment());
     } catch (URISyntaxException e) {
-        // do nothing should not happen
+      throw new IOException("URI: " + rawURI
+          + " is an invalid Har URI. Expecting har://<scheme>-<host>/<path>.");
     }
     return tmp;
   }
@@ -809,7 +810,8 @@ public class HarFileSystem extends FilterFileSystem {
     /**
      * Create an input stream that fakes all the reads/positions/seeking.
      */
-    private static class HarFsInputStream extends FSInputStream {
+    private static class HarFsInputStream extends FSInputStream
+        implements CanSetDropBehind, CanSetReadahead {
       private long position, start, end;
       //The underlying data input stream that the
       // underlying filesystem will return.
@@ -956,7 +958,18 @@ public class HarFileSystem extends FilterFileSystem {
       public void readFully(long pos, byte[] b) throws IOException {
           readFully(pos, b, 0, b.length);
       }
-      
+
+      @Override
+      public void setReadahead(Long readahead)
+          throws IOException, UnsupportedEncodingException {
+        underLyingStream.setReadahead(readahead);
+      }
+
+      @Override
+      public void setDropBehind(Boolean dropBehind)
+          throws IOException, UnsupportedEncodingException {
+        underLyingStream.setDropBehind(dropBehind);
+      }
     }
   
     /**

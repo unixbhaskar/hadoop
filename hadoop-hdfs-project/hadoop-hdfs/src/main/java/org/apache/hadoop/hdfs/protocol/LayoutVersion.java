@@ -102,9 +102,11 @@ public class LayoutVersion {
     RESERVED_REL1_3_0(-44, -41,
         "Reserved for release 1.3.0", true, ADD_INODE_ID, SNAPSHOT),
     OPTIMIZE_SNAPSHOT_INODES(-45, -43,
-        "Reduce snapshot inode memory footprint", false);
-
-
+        "Reduce snapshot inode memory footprint", false),
+    SEQUENTIAL_BLOCK_ID(-46, "Allocate block IDs sequentially and store " +
+        "block IDs in the edits log and image files"),
+    EDITLOG_SUPPORT_RETRYCACHE(-47, "Record ClientId and CallId in editlog to " 
+        + "enable rebuilding retry cache in case of HA failover");
     
     final int lv;
     final int ancestorLV;

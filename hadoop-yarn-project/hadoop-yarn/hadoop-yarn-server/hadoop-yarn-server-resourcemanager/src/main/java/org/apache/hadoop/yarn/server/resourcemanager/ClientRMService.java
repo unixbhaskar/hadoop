@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.logging.Log;
@@ -42,8 +43,8 @@ import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.CancelDelegationTokenResponse;
-import org.apache.hadoop.yarn.api.protocolrecords.GetAllApplicationsRequest;
-import org.apache.hadoop.yarn.api.protocolrecords.GetAllApplicationsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsRequest;
@@ -69,10 +70,12 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.NodeReport;
+import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.factories.RecordFactory;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
@@ -216,7 +219,7 @@ public class ClientRMService extends AbstractService implements
   
   /**
    * It gives response which includes application report if the application
-   * present otherwise gives response with application report as null.
+   * present otherwise throws ApplicationNotFoundException.
    */
   @Override
   public GetApplicationReportResponse getApplicationReport(
@@ -233,10 +236,10 @@ public class ClientRMService extends AbstractService implements
 
     RMApp application = this.rmContext.getRMApps().get(applicationId);
     if (application == null) {
-      // If the RM doesn't have the application, provide the response with
-      // application report as null and let the clients to handle.
-      return recordFactory
-          .newRecordInstance(GetApplicationReportResponse.class);
+      // If the RM doesn't have the application, throw
+      // ApplicationNotFoundException and let client to handle.
+      throw new ApplicationNotFoundException("Application with id '"
+          + applicationId + "' doesn't exist in RM.");
     }
 
     boolean allowAccess = checkAccess(callerUGI, application.getUser(),
@@ -390,8 +393,8 @@ public class ClientRMService extends AbstractService implements
   }
   
   @Override
-  public GetAllApplicationsResponse getAllApplications(
-      GetAllApplicationsRequest request) throws YarnException {
+  public GetApplicationsResponse getApplications(
+      GetApplicationsRequest request) throws YarnException {
 
     UserGroupInformation callerUGI;
     try {
@@ -401,15 +404,21 @@ public class ClientRMService extends AbstractService implements
       throw RPCUtil.getRemoteException(ie);
     }
 
+    Set<String> applicationTypes = request.getApplicationTypes();
+    boolean bypassFilter = applicationTypes.isEmpty();
     List<ApplicationReport> reports = new ArrayList<ApplicationReport>();
     for (RMApp application : this.rmContext.getRMApps().values()) {
+      if (!(bypassFilter || applicationTypes.contains(application
+          .getApplicationType()))) {
+        continue;
+      }
       boolean allowAccess = checkAccess(callerUGI, application.getUser(),
           ApplicationAccessType.VIEW_APP, application.getApplicationId());
       reports.add(application.createAndGetApplicationReport(allowAccess));
     }
 
-    GetAllApplicationsResponse response = 
-      recordFactory.newRecordInstance(GetAllApplicationsResponse.class);
+    GetApplicationsResponse response =
+      recordFactory.newRecordInstance(GetApplicationsResponse.class);
     response.setApplicationList(reports);
     return response;
   }
@@ -419,7 +428,13 @@ public class ClientRMService extends AbstractService implements
       throws YarnException {
     GetClusterNodesResponse response = 
       recordFactory.newRecordInstance(GetClusterNodesResponse.class);
-    Collection<RMNode> nodes = this.rmContext.getRMNodes().values();
+    EnumSet<NodeState> nodeStates = request.getNodeStates();
+    if (nodeStates == null || nodeStates.isEmpty()) {
+      nodeStates = EnumSet.allOf(NodeState.class);
+    }
+    Collection<RMNode> nodes = RMServerUtils.queryRMNodes(rmContext,
+        nodeStates);
+    
     List<NodeReport> nodeReports = new ArrayList<NodeReport>(nodes.size());
     for (RMNode nodeInfo : nodes) {
       nodeReports.add(createNodeReports(nodeInfo));

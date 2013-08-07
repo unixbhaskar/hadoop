@@ -176,7 +176,8 @@
   <description>User added environment variables for the task tracker child 
   processes. Example :
   1) A=foo  This will set the env variable A to foo
-  2) B=$B:c This is inherit nodemanager's B env variable.
+  2) B=$B:c This is inherit nodemanager's B env variable on Unix.
+  3) B=%B%;c This is inherit nodemanager's B env variable on Windows.
   </description>
 </property>
 
@@ -1135,6 +1136,18 @@
   <name>mapreduce.jobhistory.minicluster.fixed.ports</name>
   <value>false</value>
   <description>Whether to use fixed ports with the minicluster</description>
+</property>
+
+<property>
+  <name>mapreduce.jobhistory.admin.address</name>
+  <value>0.0.0.0:10033</value>
+  <description>The address of the History server admin interface.</description>
+</property>
+
+<property>
+  <name>mapreduce.jobhistory.admin.acl</name>
+  <value>*</value>
+  <description>ACL of who can be admin of the History server.</description>
 </property>
 
 </configuration>

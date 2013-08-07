@@ -21,7 +21,9 @@ package org.apache.hadoop.yarn.client.api.impl;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -31,10 +33,10 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
-import org.apache.hadoop.yarn.api.protocolrecords.GetAllApplicationsRequest;
-import org.apache.hadoop.yarn.api.protocolrecords.GetAllApplicationsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesRequest;
@@ -51,16 +53,20 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.NodeReport;
+import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Token;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
+import org.apache.hadoop.yarn.client.ClientRMProxy;
 import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.client.api.YarnClientApplication;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
-import org.apache.hadoop.yarn.ipc.YarnRPC;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
+import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
+import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -78,16 +84,7 @@ public class YarnClientImpl extends YarnClient {
   private static final String ROOT = "root";
 
   public YarnClientImpl() {
-    this(null);
-  }
-  
-  public YarnClientImpl(InetSocketAddress rmAddress) {
-    this(YarnClientImpl.class.getName(), rmAddress);
-  }
-
-  public YarnClientImpl(String name, InetSocketAddress rmAddress) {
-    super(name);
-    this.rmAddress = rmAddress;
+    super(YarnClientImpl.class.getName());
   }
 
   private static InetSocketAddress getRmAddress(Configuration conf) {
@@ -97,9 +94,7 @@ public class YarnClientImpl extends YarnClient {
 
   @Override
   protected void serviceInit(Configuration conf) throws Exception {
-    if (this.rmAddress == null) {
-      this.rmAddress = getRmAddress(conf);
-    }
+    this.rmAddress = getRmAddress(conf);
     statePollIntervalMillis = conf.getLong(
         YarnConfiguration.YARN_CLIENT_APP_SUBMISSION_POLL_INTERVAL_MS,
         YarnConfiguration.DEFAULT_YARN_CLIENT_APP_SUBMISSION_POLL_INTERVAL_MS);
@@ -108,12 +103,11 @@ public class YarnClientImpl extends YarnClient {
 
   @Override
   protected void serviceStart() throws Exception {
-    YarnRPC rpc = YarnRPC.create(getConfig());
-
-    this.rmClient = (ApplicationClientProtocol) rpc.getProxy(
-        ApplicationClientProtocol.class, rmAddress, getConfig());
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Connecting to ResourceManager at " + rmAddress);
+    try {
+      rmClient = ClientRMProxy.createRMProxy(getConfig(),
+            ApplicationClientProtocol.class);
+    } catch (IOException e) {
+      throw new YarnRuntimeException(e);
     }
     super.serviceStart();
   }
@@ -203,12 +197,30 @@ public class YarnClientImpl extends YarnClient {
     return response.getApplicationReport();
   }
 
+  public org.apache.hadoop.security.token.Token<AMRMTokenIdentifier>
+      getAMRMToken(ApplicationId appId) throws YarnException, IOException {
+    Token token = getApplicationReport(appId).getAMRMToken();
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> amrmToken =
+        null;
+    if (token != null) {
+      amrmToken = ConverterUtils.convertFromYarn(token, null);
+    }
+    return amrmToken;
+  }
+
   @Override
-  public List<ApplicationReport> getApplicationList()
-      throws YarnException, IOException {
-    GetAllApplicationsRequest request =
-        Records.newRecord(GetAllApplicationsRequest.class);
-    GetAllApplicationsResponse response = rmClient.getAllApplications(request);
+  public List<ApplicationReport> getApplications() throws YarnException,
+      IOException {
+    return getApplications(null);
+  }
+
+  @Override
+  public List<ApplicationReport> getApplications(
+      Set<String> applicationTypes) throws YarnException, IOException {
+    GetApplicationsRequest request =
+        applicationTypes == null ? GetApplicationsRequest.newInstance()
+            : GetApplicationsRequest.newInstance(applicationTypes);
+    GetApplicationsResponse response = rmClient.getApplications(request);
     return response.getApplicationList();
   }
 
@@ -222,10 +234,15 @@ public class YarnClientImpl extends YarnClient {
   }
 
   @Override
-  public List<NodeReport> getNodeReports() throws YarnException,
+  public List<NodeReport> getNodeReports(NodeState... states) throws YarnException,
       IOException {
-    GetClusterNodesRequest request =
-        Records.newRecord(GetClusterNodesRequest.class);
+    EnumSet<NodeState> statesSet = (states.length == 0) ?
+        EnumSet.allOf(NodeState.class) : EnumSet.noneOf(NodeState.class);
+    for (NodeState state : states) {
+      statesSet.add(state);
+    }
+    GetClusterNodesRequest request = GetClusterNodesRequest
+        .newInstance(statesSet);
     GetClusterNodesResponse response = rmClient.getClusterNodes(request);
     return response.getNodeReports();
   }

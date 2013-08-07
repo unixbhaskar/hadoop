@@ -72,6 +72,7 @@ import org.apache.hadoop.hdfs.server.protocol.KeyUpdateCommand;
 import org.apache.hadoop.hdfs.server.protocol.ReceivedDeletedBlockInfo;
 import org.apache.hadoop.hdfs.util.LightWeightLinkedSet;
 import org.apache.hadoop.net.Node;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.Time;
 
@@ -86,7 +87,7 @@ import com.google.common.collect.Sets;
 public class BlockManager {
 
   static final Log LOG = LogFactory.getLog(BlockManager.class);
-  static final Log blockLog = NameNode.blockStateChangeLog;
+  public static final Log blockLog = NameNode.blockStateChangeLog;
 
   /** Default load factor of map */
   public static final float DEFAULT_MAP_LOAD_FACTOR = 0.75f;
@@ -216,6 +217,9 @@ public class BlockManager {
   
   // whether or not to issue block encryption keys.
   final boolean encryptDataTransfer;
+  
+  // Max number of blocks to log info about during a block report.
+  private final long maxNumBlocksToLog;
 
   /**
    * When running inside a Standby node, the node may receive block reports
@@ -227,6 +231,9 @@ public class BlockManager {
 
   /** for block replicas placement */
   private BlockPlacementPolicy blockplacement;
+
+  /** Check whether name system is running before terminating */
+  private boolean checkNSRunning = true;
   
   public BlockManager(final Namesystem namesystem, final FSClusterStats stats,
       final Configuration conf) throws IOException {
@@ -294,6 +301,10 @@ public class BlockManager {
         conf.getBoolean(DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_KEY,
             DFSConfigKeys.DFS_ENCRYPT_DATA_TRANSFER_DEFAULT);
     
+    this.maxNumBlocksToLog =
+        conf.getLong(DFSConfigKeys.DFS_MAX_NUM_BLOCKS_TO_LOG_KEY,
+            DFSConfigKeys.DFS_MAX_NUM_BLOCKS_TO_LOG_DEFAULT);
+    
     LOG.info("defaultReplication         = " + defaultReplication);
     LOG.info("maxReplication             = " + maxReplication);
     LOG.info("minReplication             = " + minReplication);
@@ -301,6 +312,7 @@ public class BlockManager {
     LOG.info("shouldCheckForEnoughRacks  = " + shouldCheckForEnoughRacks);
     LOG.info("replicationRecheckInterval = " + replicationRecheckInterval);
     LOG.info("encryptDataTransfer        = " + encryptDataTransfer);
+    LOG.info("maxNumBlocksToLog          = " + maxNumBlocksToLog);
   }
 
   private static BlockTokenSecretManager createBlockTokenSecretManager(
@@ -311,6 +323,12 @@ public class BlockManager {
     LOG.info(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY + "=" + isEnabled);
 
     if (!isEnabled) {
+      if (UserGroupInformation.isSecurityEnabled()) {
+	      LOG.error("Security is enabled but block access tokens " +
+		      "(via " + DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY + ") " +
+		      "aren't enabled. This may cause issues " +
+		      "when clients attempt to talk to a DataNode.");
+      }
       return null;
     }
 
@@ -354,6 +372,12 @@ public class BlockManager {
   @VisibleForTesting
   public BlockTokenSecretManager getBlockTokenSecretManager() {
     return blockTokenSecretManager;
+  }
+
+  /** Allow silent termination of replication monitor for testing */
+  @VisibleForTesting
+  void enableRMTerminationForTesting() {
+    checkNSRunning = false;
   }
 
   private boolean isBlockTokenEnabled() {
@@ -836,8 +860,10 @@ public class BlockManager {
   public void setBlockToken(final LocatedBlock b,
       final BlockTokenSecretManager.AccessMode mode) throws IOException {
     if (isBlockTokenEnabled()) {
-      b.setBlockToken(blockTokenSecretManager.generateToken(b.getBlock(), 
-          EnumSet.of(mode)));
+      // Use cached UGI if serving RPC calls.
+      b.setBlockToken(blockTokenSecretManager.generateToken(
+          NameNode.getRemoteUser().getShortUserName(),
+          b.getBlock(), EnumSet.of(mode)));
     }    
   }
 
@@ -1182,7 +1208,6 @@ public class BlockManager {
             // abandoned block or block reopened for append
             if(bc == null || bc instanceof MutableBlockCollection) {
               neededReplications.remove(block, priority); // remove from neededReplications
-              neededReplications.decrementReplicationIndex(priority);
               continue;
             }
 
@@ -1209,7 +1234,6 @@ public class BlockManager {
               if ( (pendingReplications.getNumReplicas(block) > 0) ||
                    (blockHasEnoughRacks(block)) ) {
                 neededReplications.remove(block, priority); // remove from neededReplications
-                neededReplications.decrementReplicationIndex(priority);
                 blockLog.info("BLOCK* Removing " + block
                     + " from neededReplications as it has enough replicas");
                 continue;
@@ -1269,7 +1293,6 @@ public class BlockManager {
           if(bc == null || bc instanceof MutableBlockCollection) {
             neededReplications.remove(block, priority); // remove from neededReplications
             rw.targets = null;
-            neededReplications.decrementReplicationIndex(priority);
             continue;
           }
           requiredReplication = bc.getBlockReplication();
@@ -1283,7 +1306,6 @@ public class BlockManager {
             if ( (pendingReplications.getNumReplicas(block) > 0) ||
                  (blockHasEnoughRacks(block)) ) {
               neededReplications.remove(block, priority); // remove from neededReplications
-              neededReplications.decrementReplicationIndex(priority);
               rw.targets = null;
               blockLog.info("BLOCK* Removing " + block
                   + " from neededReplications as it has enough replicas");
@@ -1310,7 +1332,7 @@ public class BlockManager {
           // Move the block-replication into a "pending" state.
           // The reason we use 'pending' is so we can retry
           // replications that fail after an appropriate amount of time.
-          pendingReplications.increment(block, targets.length);
+          pendingReplications.increment(block, targets);
           if(blockLog.isDebugEnabled()) {
             blockLog.debug(
                 "BLOCK* block " + block
@@ -1320,7 +1342,6 @@ public class BlockManager {
           // remove from neededReplications
           if(numEffectiveReplicas + targets.length >= requiredReplication) {
             neededReplications.remove(block, priority); // remove from neededReplications
-            neededReplications.decrementReplicationIndex(priority);
           }
         }
       }
@@ -1689,8 +1710,14 @@ public class BlockManager {
     for (Block b : toRemove) {
       removeStoredBlock(b, node);
     }
+    int numBlocksLogged = 0;
     for (BlockInfo b : toAdd) {
-      addStoredBlock(b, node, null, true);
+      addStoredBlock(b, node, null, numBlocksLogged < maxNumBlocksToLog);
+      numBlocksLogged++;
+    }
+    if (numBlocksLogged > maxNumBlocksToLog) {
+      blockLog.info("BLOCK* processReport: logged info for " + maxNumBlocksToLog
+          + " of " + numBlocksLogged + " reported.");
     }
     for (Block b : toInvalidate) {
       blockLog.info("BLOCK* processReport: "
@@ -1726,7 +1753,7 @@ public class BlockManager {
       ReplicaState reportedState = itBR.getCurrentReplicaState();
       
       if (shouldPostponeBlocksFromFuture &&
-          namesystem.isGenStampInFuture(iblk.getGenerationStamp())) {
+          namesystem.isGenStampInFuture(iblk)) {
         queueReportedBlock(node, iblk, reportedState,
             QUEUE_REASON_FUTURE_GENSTAMP);
         continue;
@@ -1848,7 +1875,7 @@ public class BlockManager {
     }
   
     if (shouldPostponeBlocksFromFuture &&
-        namesystem.isGenStampInFuture(block.getGenerationStamp())) {
+        namesystem.isGenStampInFuture(block)) {
       queueReportedBlock(dn, block, reportedState,
           QUEUE_REASON_FUTURE_GENSTAMP);
       return null;
@@ -2590,6 +2617,8 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
   void addBlock(DatanodeDescriptor node, Block block, String delHint)
       throws IOException {
     // decrement number of blocks scheduled to this datanode.
+    // for a retry request (of DatanodeProtocol#blockReceivedAndDeleted with 
+    // RECEIVED_BLOCK), we currently also decrease the approximate number. 
     node.decBlocksScheduled();
 
     // get the deletion hint node
@@ -2605,7 +2634,7 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
     //
     // Modify the blocks->datanode map and node's map.
     //
-    pendingReplications.decrement(block);
+    pendingReplications.decrement(block, node);
     processAndHandleReportedBlock(node, block, ReplicaState.FINALIZED,
         delHintNode);
   }
@@ -2628,8 +2657,14 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
     for (StatefulBlockInfo b : toUC) { 
       addStoredBlockUnderConstruction(b.storedBlock, node, b.reportedState);
     }
+    long numBlocksLogged = 0;
     for (BlockInfo b : toAdd) {
-      addStoredBlock(b, node, delHintNode, true);
+      addStoredBlock(b, node, delHintNode, numBlocksLogged < maxNumBlocksToLog);
+      numBlocksLogged++;
+    }
+    if (numBlocksLogged > maxNumBlocksToLog) {
+      blockLog.info("BLOCK* addBlock: logged info for " + maxNumBlocksToLog
+          + " of " + numBlocksLogged + " reported.");
     }
     for (Block b : toInvalidate) {
       blockLog.info("BLOCK* addBlock: block "
@@ -2646,64 +2681,58 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
    * The given node is reporting incremental information about some blocks.
    * This includes blocks that are starting to be received, completed being
    * received, or deleted.
+   * 
+   * This method must be called with FSNamesystem lock held.
    */
-  public void processIncrementalBlockReport(final DatanodeID nodeID, 
-     final String poolId, 
-     final ReceivedDeletedBlockInfo blockInfos[]
-  ) throws IOException {
-    namesystem.writeLock();
+  public void processIncrementalBlockReport(final DatanodeID nodeID,
+      final String poolId, final ReceivedDeletedBlockInfo blockInfos[])
+      throws IOException {
+    assert namesystem.hasWriteLock();
     int received = 0;
     int deleted = 0;
     int receiving = 0;
-    try {
-      final DatanodeDescriptor node = datanodeManager.getDatanode(nodeID);
-      if (node == null || !node.isAlive) {
-        blockLog
-            .warn("BLOCK* processIncrementalBlockReport"
-                + " is received from dead or unregistered node "
-                + nodeID);
-        throw new IOException(
-            "Got incremental block report from unregistered or dead node");
-      }
-
-      for (ReceivedDeletedBlockInfo rdbi : blockInfos) {
-        switch (rdbi.getStatus()) {
-        case DELETED_BLOCK:
-          removeStoredBlock(rdbi.getBlock(), node);
-          deleted++;
-          break;
-        case RECEIVED_BLOCK:
-          addBlock(node, rdbi.getBlock(), rdbi.getDelHints());
-          received++;
-          break;
-        case RECEIVING_BLOCK:
-          receiving++;
-          processAndHandleReportedBlock(node, rdbi.getBlock(),
-              ReplicaState.RBW, null);
-          break;
-        default:
-          String msg = 
-            "Unknown block status code reported by " + nodeID +
-            ": " + rdbi;
-          blockLog.warn(msg);
-          assert false : msg; // if assertions are enabled, throw.
-          break;
-        }
-        if (blockLog.isDebugEnabled()) {
-          blockLog.debug("BLOCK* block "
-              + (rdbi.getStatus()) + ": " + rdbi.getBlock()
-              + " is received from " + nodeID);
-        }
-      }
-    } finally {
-      namesystem.writeUnlock();
+    final DatanodeDescriptor node = datanodeManager.getDatanode(nodeID);
+    if (node == null || !node.isAlive) {
       blockLog
-          .debug("*BLOCK* NameNode.processIncrementalBlockReport: " + "from "
-              + nodeID
-              +  " receiving: " + receiving + ", "
-              + " received: " + received + ", "
-              + " deleted: " + deleted);
+          .warn("BLOCK* processIncrementalBlockReport"
+              + " is received from dead or unregistered node "
+              + nodeID);
+      throw new IOException(
+          "Got incremental block report from unregistered or dead node");
     }
+
+    for (ReceivedDeletedBlockInfo rdbi : blockInfos) {
+      switch (rdbi.getStatus()) {
+      case DELETED_BLOCK:
+        removeStoredBlock(rdbi.getBlock(), node);
+        deleted++;
+        break;
+      case RECEIVED_BLOCK:
+        addBlock(node, rdbi.getBlock(), rdbi.getDelHints());
+        received++;
+        break;
+      case RECEIVING_BLOCK:
+        receiving++;
+        processAndHandleReportedBlock(node, rdbi.getBlock(),
+            ReplicaState.RBW, null);
+        break;
+      default:
+        String msg = 
+          "Unknown block status code reported by " + nodeID +
+          ": " + rdbi;
+        blockLog.warn(msg);
+        assert false : msg; // if assertions are enabled, throw.
+        break;
+      }
+      if (blockLog.isDebugEnabled()) {
+        blockLog.debug("BLOCK* block "
+            + (rdbi.getStatus()) + ": " + rdbi.getBlock()
+            + " is received from " + nodeID);
+      }
+    }
+    blockLog.debug("*BLOCK* NameNode.processIncrementalBlockReport: " + "from "
+        + nodeID + " receiving: " + receiving + ", " + " received: " + received
+        + ", " + " deleted: " + deleted);
   }
 
   /**
@@ -3128,6 +3157,9 @@ assert storedBlock.findDatanode(dn) < 0 : "Block " + block
               LOG.info("ReplicationMonitor received an exception"
                   + " while shutting down.", t);
             }
+            break;
+          } else if (!checkNSRunning && t instanceof InterruptedException) {
+            LOG.info("Stopping ReplicationMonitor for testing.");
             break;
           }
           LOG.fatal("ReplicationMonitor thread received Runtime exception. ", t);

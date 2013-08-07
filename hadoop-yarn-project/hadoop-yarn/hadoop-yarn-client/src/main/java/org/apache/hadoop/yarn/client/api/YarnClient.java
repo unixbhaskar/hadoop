@@ -19,8 +19,8 @@
 package org.apache.hadoop.yarn.client.api;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -32,12 +32,14 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.NodeReport;
+import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Token;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
 import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl;
 import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 
 @InterfaceAudience.Public
 @InterfaceStability.Stable
@@ -49,25 +51,6 @@ public abstract class YarnClient extends AbstractService {
   @Public
   public static YarnClient createYarnClient() {
     YarnClient client = new YarnClientImpl();
-    return client;
-  }
-
-  /**
-   * Create a new instance of YarnClient.
-   */
-  @Public
-  public static YarnClient createYarnClient(InetSocketAddress rmAddress) {
-    YarnClient client = new YarnClientImpl(rmAddress);
-    return client;
-  }
-
-  /**
-   * Create a new instance of YarnClient.
-   */
-  @Public
-  public static YarnClient createYarnClient(String name,
-      InetSocketAddress rmAddress) {
-    YarnClient client = new YarnClientImpl(name, rmAddress);
     return client;
   }
 
@@ -159,6 +142,32 @@ public abstract class YarnClient extends AbstractService {
       throws YarnException, IOException;
 
   /**
+   * Get the AMRM token of the application.
+   * <p/>
+   * The AMRM token is required for AM to RM scheduling operations. For 
+   * managed Application Masters Yarn takes care of injecting it. For unmanaged
+   * Applications Masters, the token must be obtained via this method and set
+   * in the {@link org.apache.hadoop.security.UserGroupInformation} of the
+   * current user.
+   * <p/>
+   * The AMRM token will be returned only if all the following conditions are
+   * met:
+   * <li>
+   *   <ul>the requester is the owner of the ApplicationMaster</ul>
+   *   <ul>the application master is an unmanaged ApplicationMaster</ul>
+   *   <ul>the application master is in ACCEPTED state</ul>
+   * </li>
+   * Else this method returns NULL.
+   *
+   * @param appId {@link ApplicationId} of the application to get the AMRM token
+   * @return the AMRM token if available
+   * @throws YarnException
+   * @throws IOException
+   */
+  public abstract org.apache.hadoop.security.token.Token<AMRMTokenIdentifier>
+      getAMRMToken(ApplicationId appId) throws YarnException, IOException;
+
+  /**
    * <p>
    * Get a report (ApplicationReport) of all Applications in the cluster.
    * </p>
@@ -173,8 +182,28 @@ public abstract class YarnClient extends AbstractService {
    * @throws YarnException
    * @throws IOException
    */
-  public abstract List<ApplicationReport> getApplicationList() throws YarnException,
-      IOException;
+  public abstract List<ApplicationReport> getApplications()
+      throws YarnException, IOException;
+
+  /**
+   * <p>
+   * Get a report (ApplicationReport) of Applications
+   * matching the given application types in the cluster.
+   * </p>
+   *
+   * <p>
+   * If the user does not have <code>VIEW_APP</code> access for an application
+   * then the corresponding report will be filtered as described in
+   * {@link #getApplicationReport(ApplicationId)}.
+   * </p>
+   *
+   * @param applicationTypes
+   * @return a list of reports of applications
+   * @throws YarnException
+   * @throws IOException
+   */
+  public abstract List<ApplicationReport> getApplications(
+      Set<String> applicationTypes) throws YarnException, IOException;
 
   /**
    * <p>
@@ -190,14 +219,17 @@ public abstract class YarnClient extends AbstractService {
 
   /**
    * <p>
-   * Get a report of all nodes ({@link NodeReport}) in the cluster.
+   * Get a report of nodes ({@link NodeReport}) in the cluster.
    * </p>
    * 
-   * @return A list of report of all nodes
+   * @param states The {@link NodeState}s to filter on. If no filter states are
+   *          given, nodes in all states will be returned.
+   * @return A list of node reports
    * @throws YarnException
    * @throws IOException
    */
-  public abstract List<NodeReport> getNodeReports() throws YarnException, IOException;
+  public abstract List<NodeReport> getNodeReports(NodeState... states)
+      throws YarnException, IOException;
 
   /**
    * <p>
