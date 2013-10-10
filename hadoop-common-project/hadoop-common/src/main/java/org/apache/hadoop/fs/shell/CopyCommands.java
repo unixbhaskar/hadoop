@@ -133,7 +133,8 @@ class CopyCommands {
       "Copy files that match the file pattern <src> to a\n" +
       "destination.  When copying multiple files, the destination\n" +
       "must be a directory. Passing -p preserves access and\n" +
-      "modification times, ownership and the mode.\n";
+      "modification times, ownership and the mode. Passing -f\n" +
+      "overwrites the destination if it already exists.\n";
     
     @Override
     protected void processOptions(LinkedList<String> args) throws IOException {
@@ -186,7 +187,8 @@ class CopyCommands {
       "into fs. Copying fails if the file already\n" +
       "exists, unless the -f flag is given. Passing\n" +
       "-p preserves access and modification times,\n" +
-      "ownership and the mode.\n";
+      "ownership and the mode. Passing -f overwrites\n" +
+      "the destination if it already exists.\n";
 
     @Override
     protected void processOptions(LinkedList<String> args) throws IOException {
@@ -202,13 +204,18 @@ class CopyCommands {
     // commands operating on local paths have no need for glob expansion
     @Override
     protected List<PathData> expandArgument(String arg) throws IOException {
+      List<PathData> items = new LinkedList<PathData>();
       try {
-        List<PathData> items = new LinkedList<PathData>();
         items.add(new PathData(new URI(arg), getConf()));
-        return items;
       } catch (URISyntaxException e) {
-        throw new IOException("unexpected URISyntaxException", e);
+        if (Path.WINDOWS) {
+          // Unlike URI, PathData knows how to parse Windows drive-letter paths.
+          items.add(new PathData(arg, getConf()));
+        } else {
+          throw new IOException("unexpected URISyntaxException", e);
+        }
       }
+      return items;
     }
 
     @Override

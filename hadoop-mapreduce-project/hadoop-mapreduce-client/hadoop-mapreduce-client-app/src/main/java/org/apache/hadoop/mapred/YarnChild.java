@@ -41,6 +41,7 @@ import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.mapreduce.MRConfig;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.TaskType;
+import org.apache.hadoop.mapreduce.counters.Limits;
 import org.apache.hadoop.mapreduce.filecache.DistributedCache;
 import org.apache.hadoop.mapreduce.security.TokenCache;
 import org.apache.hadoop.mapreduce.security.token.JobTokenIdentifier;
@@ -75,9 +76,11 @@ class YarnChild {
     Thread.setDefaultUncaughtExceptionHandler(new YarnUncaughtExceptionHandler());
     LOG.debug("Child starting");
 
-    final JobConf defaultConf = new JobConf();
-    defaultConf.addResource(MRJobConfig.JOB_CONF_FILE);
-    UserGroupInformation.setConfiguration(defaultConf);
+    final JobConf job = new JobConf();
+    // Initing with our JobConf allows us to avoid loading confs twice
+    Limits.init(job);
+    job.addResource(MRJobConfig.JOB_CONF_FILE);
+    UserGroupInformation.setConfiguration(job);
 
     String host = args[0];
     int port = Integer.parseInt(args[1]);
@@ -111,7 +114,7 @@ class YarnChild {
       @Override
       public TaskUmbilicalProtocol run() throws Exception {
         return (TaskUmbilicalProtocol)RPC.getProxy(TaskUmbilicalProtocol.class,
-            TaskUmbilicalProtocol.versionID, address, defaultConf);
+            TaskUmbilicalProtocol.versionID, address, job);
       }
     });
 
@@ -140,7 +143,7 @@ class YarnChild {
       YarnChild.taskid = task.getTaskID();
 
       // Create the job-conf and set credentials
-      final JobConf job = configureTask(task, credentials, jt);
+      configureTask(job, task, credentials, jt);
 
       // log the system properties
       String systemPropsToLog = MRApps.getSystemPropertiesToLog(job);
@@ -260,11 +263,10 @@ class YarnChild {
     job.set(MRJobConfig.JOB_LOCAL_DIR,workDir.toString());
   }
 
-  private static JobConf configureTask(Task task, Credentials credentials,
-      Token<JobTokenIdentifier> jt) throws IOException {
-    final JobConf job = new JobConf(MRJobConfig.JOB_CONF_FILE);
+  private static void configureTask(JobConf job, Task task,
+      Credentials credentials, Token<JobTokenIdentifier> jt) throws IOException {
     job.setCredentials(credentials);
-
+    
     ApplicationAttemptId appAttemptId =
         ConverterUtils.toContainerId(
             System.getenv(Environment.CONTAINER_ID.name()))
@@ -306,7 +308,6 @@ class YarnChild {
     writeLocalJobFile(localTaskFile, job);
     task.setJobFile(localTaskFile.toString());
     task.setConf(job);
-    return job;
   }
 
   /**

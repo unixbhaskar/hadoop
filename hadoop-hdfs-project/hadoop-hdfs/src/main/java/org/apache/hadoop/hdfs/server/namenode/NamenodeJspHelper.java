@@ -30,8 +30,11 @@ import java.net.URLEncoder;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 import javax.servlet.ServletContext;
 import javax.servlet.http.HttpServletRequest;
@@ -97,6 +100,24 @@ class NamenodeJspHelper {
     } else {
       return "<div class=\"security\">Security is <em>OFF</em></div>";
     }
+  }
+
+  static String getRollingUpgradeText(FSNamesystem fsn) {
+    if (fsn == null) {
+      return "";
+    }
+
+    DatanodeManager dm = fsn.getBlockManager().getDatanodeManager();
+    Map<String, Integer> list = dm.getDatanodesSoftwareVersions();
+    if(list.size() > 1) {
+      StringBuffer status = new StringBuffer("Rolling upgrades in progress. " +
+      "There are " + list.size() + " versions of datanodes currently live: ");
+      for(Map.Entry<String, Integer> ver: list.entrySet()) {
+        status.append(ver.getKey() + "(" + ver.getValue() + "), ");
+      }
+      return status.substring(0, status.length()-2);
+    }
+    return "";
   }
 
   static String getInodeLimitText(FSNamesystem fsn) {
@@ -186,6 +207,20 @@ class NamenodeJspHelper {
       return result.toString();
     }
     return "";
+  }
+
+  static void generateSnapshotReport(JspWriter out, FSNamesystem fsn)
+      throws IOException {
+    if (fsn == null) {
+      return;
+    }
+    out.println("<div id=\"snapshotstats\"><div class=\"dfstable\">"
+        + "<table class=\"storage\" title=\"Snapshot Summary\">\n"
+        + "<thead><tr><td><b>Snapshottable directories</b></td>"
+        + "<td><b>Snapshotted directories</b></td></tr></thead>");
+
+    out.println(String.format("<td>%d</td><td>%d</td>", fsn.getNumSnapshottableDirs(), fsn.getNumSnapshots()));
+    out.println("</table></div></div>");
   }
 
   static class HealthJsp {
@@ -621,25 +656,22 @@ class NamenodeJspHelper {
         .getAttribute(JspHelper.CURRENT_CONF);
     // We can't redirect if there isn't a DN to redirect to.
     // Lets instead show a proper error message.
-    if (nn.getNamesystem().getNumLiveDataNodes() < 1) {
+    FSNamesystem fsn = nn.getNamesystem();
+
+    DatanodeID datanode = null;
+    if (fsn != null && fsn.getNumLiveDataNodes() >= 1) {
+      datanode = getRandomDatanode(nn);
+    }
+
+    if (datanode == null) {
       throw new IOException("Can't browse the DFS since there are no " +
           "live nodes available to redirect to.");
     }
-    final DatanodeID datanode = getRandomDatanode(nn);;
+
     UserGroupInformation ugi = JspHelper.getUGI(context, request, conf);
+    // if the user is defined, get a delegation token and stringify it
     String tokenString = getDelegationToken(
         nn.getRpcServer(), request, conf, ugi);
-    // if the user is defined, get a delegation token and stringify it
-    final String redirectLocation;
-    final String nodeToRedirect;
-    int redirectPort;
-    if (datanode != null) {
-      nodeToRedirect = datanode.getIpAddr();
-      redirectPort = datanode.getInfoPort();
-    } else {
-      nodeToRedirect = nn.getHttpAddress().getHostName();
-      redirectPort = nn.getHttpAddress().getPort();
-    }
 
     InetSocketAddress rpcAddr = nn.getNameNodeAddress();
     String rpcHost = rpcAddr.getAddress().isAnyLocalAddress()
@@ -647,14 +679,29 @@ class NamenodeJspHelper {
       : rpcAddr.getAddress().getHostAddress();
     String addr = rpcHost + ":" + rpcAddr.getPort();
 
-    String fqdn = InetAddress.getByName(nodeToRedirect).getCanonicalHostName();
-    redirectLocation = HttpConfig.getSchemePrefix() + fqdn + ":" + redirectPort
+    final String redirectLocation =
+        JspHelper.Url.url(request.getScheme(), datanode)
         + "/browseDirectory.jsp?namenodeInfoPort="
-        + nn.getHttpAddress().getPort() + "&dir=/"
+        + request.getServerPort() + "&dir=/"
         + (tokenString == null ? "" :
            JspHelper.getDelegationTokenUrlParam(tokenString))
         + JspHelper.getUrlParam(JspHelper.NAMENODE_ADDRESS, addr);
+
     resp.sendRedirect(redirectLocation);
+  }
+
+  /**
+   * Returns a descriptive label for the running NameNode.  If the NameNode has
+   * initialized to the point of running its RPC server, then this label consists
+   * of the host and port of the RPC server.  Otherwise, the label is a message
+   * stating that the NameNode is still initializing.
+   * 
+   * @param nn NameNode to describe
+   * @return String NameNode label
+   */
+  static String getNameNodeLabel(NameNode nn) {
+    return nn.getRpcServer() != null ? nn.getNameNodeAddressHostPortString() :
+      "initializing";
   }
 
   static class NodeListJsp {
@@ -694,12 +741,11 @@ class NamenodeJspHelper {
     }
 
     private void generateNodeDataHeader(JspWriter out, DatanodeDescriptor d,
-        String suffix, boolean alive, int nnHttpPort, String nnaddr)
+        String suffix, boolean alive, int nnInfoPort, String nnaddr, String scheme)
         throws IOException {
       // from nn_browsedfscontent.jsp:
-      String url = HttpConfig.getSchemePrefix() + d.getHostName() + ":"
-          + d.getInfoPort()
-          + "/browseDirectory.jsp?namenodeInfoPort=" + nnHttpPort + "&dir="
+      String url = "///" + JspHelper.Url.authority(scheme, d)
+          + "/browseDirectory.jsp?namenodeInfoPort=" + nnInfoPort + "&dir="
           + URLEncoder.encode("/", "UTF-8")
           + JspHelper.getUrlParam(JspHelper.NAMENODE_ADDRESS, nnaddr);
 
@@ -709,16 +755,16 @@ class NamenodeJspHelper {
       int idx = (suffix != null && name.endsWith(suffix)) ? name
           .indexOf(suffix) : -1;
 
-      out.print(rowTxt() + "<td class=\"name\"><a title=\"" + d.getXferAddr()
+      out.print(rowTxt() + "<td class=\"name\"> <a title=\"" + url
           + "\" href=\"" + url + "\">"
           + ((idx > 0) ? name.substring(0, idx) : name) + "</a>"
-          + ((alive) ? "" : "\n"));
+          + ((alive) ? "" : "\n") + "<td class=\"address\">" + d.getXferAddr());
     }
 
     void generateDecommissioningNodeData(JspWriter out, DatanodeDescriptor d,
-        String suffix, boolean alive, int nnHttpPort, String nnaddr)
+        String suffix, boolean alive, int nnInfoPort, String nnaddr, String scheme)
         throws IOException {
-      generateNodeDataHeader(out, d, suffix, alive, nnHttpPort, nnaddr);
+      generateNodeDataHeader(out, d, suffix, alive, nnInfoPort, nnaddr, scheme);
       if (!alive) {
         return;
       }
@@ -742,22 +788,26 @@ class NamenodeJspHelper {
     }
     
     void generateNodeData(JspWriter out, DatanodeDescriptor d, String suffix,
-        boolean alive, int nnHttpPort, String nnaddr) throws IOException {
+        boolean alive, int nnInfoPort, String nnaddr, String scheme) throws IOException {
       /*
        * Say the datanode is dn1.hadoop.apache.org with ip 192.168.0.5 we use:
        * 1) d.getHostName():d.getPort() to display. Domain and port are stripped
-       *    if they are common across the nodes. i.e. "dn1"
-       * 2) d.getHost():d.Port() for "title". i.e. "192.168.0.5:50010"
-       * 3) d.getHostName():d.getInfoPort() for url.
+       *    if they are common across the nodes. i.e. "dn1" 
+       * 2) d.getHostName():d.getInfoPort() for url and title.
        *    i.e. "http://dn1.hadoop.apache.org:50075/..."
+       * 3) d.getXferAddr() for "Transferring Address". i.e. "192.168.0.5:50010"
        * Note that "d.getHost():d.getPort()" is what DFS clients use to
        * interact with datanodes.
        */
 
-      generateNodeDataHeader(out, d, suffix, alive, nnHttpPort, nnaddr);
+      generateNodeDataHeader(out, d, suffix, alive, nnInfoPort, nnaddr, scheme);
+      long currentTime = Time.now();
+      long timestamp = d.getLastUpdate();
       if (!alive) {
-        out.print("<td class=\"decommissioned\"> " + 
-            d.isDecommissioned() + "\n");
+        out.print("<td class=\"lastcontact\"> "
+            + new Date(timestamp) 
+            + "<td class=\"decommissioned\"> "
+            + d.isDecommissioned() + "\n");
         return;
       }
 
@@ -770,9 +820,6 @@ class NamenodeJspHelper {
       String percentRemaining = fraction2String(d.getRemainingPercent());
 
       String adminState = d.getAdminState().toString();
-
-      long timestamp = d.getLastUpdate();
-      long currentTime = Time.now();
       
       long bpUsed = d.getBlockPoolUsed();
       String percentBpUsed = fraction2String(d.getBlockPoolUsedPercent());
@@ -802,24 +849,26 @@ class NamenodeJspHelper {
           + "<td align=\"right\" class=\"pcbpused\">"
           + percentBpUsed
           + "<td align=\"right\" class=\"volfails\">"
-          + d.getVolumeFailures() + "\n");
+          + d.getVolumeFailures()
+          + "<td align=\"right\" class=\"version\">"
+          + d.getSoftwareVersion() + "\n");
     }
 
     void generateNodesList(ServletContext context, JspWriter out,
         HttpServletRequest request) throws IOException {
       final NameNode nn = NameNodeHttpServer.getNameNodeFromContext(context);
       final FSNamesystem ns = nn.getNamesystem();
+      if (ns == null) {
+        return;
+      }
       final DatanodeManager dm = ns.getBlockManager().getDatanodeManager();
 
       final List<DatanodeDescriptor> live = new ArrayList<DatanodeDescriptor>();
       final List<DatanodeDescriptor> dead = new ArrayList<DatanodeDescriptor>();
       dm.fetchDatanodes(live, dead, true);
 
-      InetSocketAddress nnSocketAddress =
-          (InetSocketAddress)context.getAttribute(
-              NameNodeHttpServer.NAMENODE_ADDRESS_ATTRIBUTE_KEY);
-      String nnaddr = nnSocketAddress.getAddress().getHostAddress() + ":"
-          + nnSocketAddress.getPort();
+      String nnaddr = nn.getServiceRpcAddress().getAddress().getHostName() + ":"
+          + nn.getServiceRpcAddress().getPort();
 
       whatNodes = request.getParameter("whatNodes"); // show only live or only
                                                      // dead nodes
@@ -855,16 +904,11 @@ class NamenodeJspHelper {
 
       counterReset();
 
-      try {
-        Thread.sleep(1000);
-      } catch (InterruptedException e) {
-      }
-
       if (live.isEmpty() && dead.isEmpty()) {
         out.print("There are no datanodes in the cluster");
       } else {
 
-        int nnHttpPort = nn.getHttpAddress().getPort();
+        int nnInfoPort = request.getServerPort();
         out.print("<div id=\"dfsnodetable\"> ");
         if (whatNodes.equals("LIVE")) {
           out.print("<a name=\"LiveNodes\" id=\"title\">" + "Live Datanodes : "
@@ -880,7 +924,9 @@ class NamenodeJspHelper {
             }
 
             out.print("<tr class=\"headerRow\"> <th " + nodeHeaderStr("name")
-                + "> Node <th " + nodeHeaderStr("lastcontact")
+                + "> Node <th " + nodeHeaderStr("address")
+                + "> Transferring<br>Address <th "
+                + nodeHeaderStr("lastcontact")
                 + "> Last <br>Contact <th " + nodeHeaderStr("adminstate")
                 + "> Admin State <th " + nodeHeaderStr("capacity")
                 + "> Configured <br>Capacity (" + diskByteStr + ") <th "
@@ -896,14 +942,16 @@ class NamenodeJspHelper {
                 + nodeHeaderStr("bpused") + "> Block Pool<br>Used (" 
                 + diskByteStr + ") <th "
                 + nodeHeaderStr("pcbpused")
-                + "> Block Pool<br>Used (%)"
-                + "> Blocks <th " + nodeHeaderStr("volfails")
-                +"> Failed Volumes\n");
+                + "> Block Pool<br>Used (%)" + " <th "
+                + nodeHeaderStr("volfails")
+                +"> Failed Volumes <th "
+                + nodeHeaderStr("versionString")
+                +"> Version\n");
 
             JspHelper.sortNodeList(live, sorterField, sorterOrder);
             for (int i = 0; i < live.size(); i++) {
-              generateNodeData(out, live.get(i), port_suffix, true, nnHttpPort,
-                  nnaddr);
+              generateNodeData(out, live.get(i), port_suffix, true, nnInfoPort,
+                  nnaddr, request.getScheme());
             }
           }
           out.print("</table>\n");
@@ -915,13 +963,17 @@ class NamenodeJspHelper {
           if (dead.size() > 0) {
             out.print("<table border=1 cellspacing=0> <tr id=\"row1\"> "
                 + "<th " + nodeHeaderStr("node")
-                + "> Node <th " + nodeHeaderStr("decommissioned")
+                + "> Node <th " + nodeHeaderStr("address")
+                + "> Transferring<br>Address <th "
+                + nodeHeaderStr("lastcontact")
+                + "> Last <br>Contact <th "
+                + nodeHeaderStr("decommissioned")
                 + "> Decommissioned\n");
 
             JspHelper.sortNodeList(dead, sorterField, sorterOrder);
             for (int i = 0; i < dead.size(); i++) {
               generateNodeData(out, dead.get(i), port_suffix, false,
-                  nnHttpPort, nnaddr);
+                  nnInfoPort, nnaddr, request.getScheme());
             }
 
             out.print("</table>\n");
@@ -935,7 +987,9 @@ class NamenodeJspHelper {
           if (decommissioning.size() > 0) {
             out.print("<table border=1 cellspacing=0> <tr class=\"headRow\"> "
                 + "<th " + nodeHeaderStr("name") 
-                + "> Node <th " + nodeHeaderStr("lastcontact")
+                + "> Node <th " + nodeHeaderStr("address")
+                + "> Transferring<br>Address <th "
+                + nodeHeaderStr("lastcontact")
                 + "> Last <br>Contact <th "
                 + nodeHeaderStr("underreplicatedblocks")
                 + "> Under Replicated Blocks <th "
@@ -950,7 +1004,7 @@ class NamenodeJspHelper {
             JspHelper.sortNodeList(decommissioning, "name", "ASC");
             for (int i = 0; i < decommissioning.size(); i++) {
               generateDecommissioningNodeData(out, decommissioning.get(i),
-                  port_suffix, true, nnHttpPort, nnaddr);
+                  port_suffix, true, nnInfoPort, nnaddr, request.getScheme());
             }
             out.print("</table>\n");
           }
@@ -978,14 +1032,16 @@ class NamenodeJspHelper {
     final BlockManager blockManager;
     
     XMLBlockInfo(FSNamesystem fsn, Long blockId) {
-      this.blockManager = fsn.getBlockManager();
+      this.blockManager = fsn != null ? fsn.getBlockManager() : null;
 
       if (blockId == null) {
         this.block = null;
         this.inode = null;
       } else {
         this.block = new Block(blockId);
-        this.inode = ((INode)blockManager.getBlockCollection(block)).asFile();
+        this.inode = blockManager != null ?
+          ((INode)blockManager.getBlockCollection(block)).asFile() :
+          null;
       }
     }
 
@@ -1059,8 +1115,10 @@ class NamenodeJspHelper {
         } 
 
         doc.startTag("replicas");
-        for(final Iterator<DatanodeDescriptor> it = blockManager.datanodeIterator(block);
-            it.hasNext(); ) {
+        for (final Iterator<DatanodeDescriptor> it = blockManager != null ?
+            blockManager.datanodeIterator(block) :
+            Collections.<DatanodeDescriptor>emptyList().iterator();
+            it.hasNext();) {
           doc.startTag("replica");
 
           DatanodeDescriptor dd = it.next();
@@ -1096,7 +1154,7 @@ class NamenodeJspHelper {
     
     XMLCorruptBlockInfo(FSNamesystem fsn, Configuration conf,
                                int numCorruptBlocks, Long startingBlockId) {
-      this.blockManager = fsn.getBlockManager();
+      this.blockManager = fsn != null ? fsn.getBlockManager() : null;
       this.conf = conf;
       this.numCorruptBlocks = numCorruptBlocks;
       this.startingBlockId = startingBlockId;
@@ -1119,16 +1177,19 @@ class NamenodeJspHelper {
       doc.endTag();
       
       doc.startTag("num_missing_blocks");
-      doc.pcdata(""+blockManager.getMissingBlocksCount());
+      doc.pcdata("" + (blockManager != null ?
+        blockManager.getMissingBlocksCount() : 0));
       doc.endTag();
       
       doc.startTag("num_corrupt_replica_blocks");
-      doc.pcdata(""+blockManager.getCorruptReplicaBlocksCount());
+      doc.pcdata("" + (blockManager != null ?
+        blockManager.getCorruptReplicaBlocksCount() : 0));
       doc.endTag();
      
       doc.startTag("corrupt_replica_block_ids");
-      final long[] corruptBlockIds = blockManager.getCorruptReplicaBlockIds(
-          numCorruptBlocks, startingBlockId);
+      final long[] corruptBlockIds = blockManager != null ?
+        blockManager.getCorruptReplicaBlockIds(numCorruptBlocks,
+        startingBlockId) : null;
       if (corruptBlockIds != null) {
         for (Long blockId: corruptBlockIds) {
           doc.startTag("block_id");

@@ -217,7 +217,6 @@
     <dependency>
       <groupId>org.apache.zookeeper</groupId>
       <artifactId>zookeeper</artifactId>
-      <version>3.4.2</version>
       <exclusions>
         <exclusion>
           <groupId>jline</groupId>
@@ -245,14 +244,12 @@
     <dependency>
       <groupId>org.apache.zookeeper</groupId>
       <artifactId>zookeeper</artifactId>
-      <version>3.4.2</version>
       <type>test-jar</type>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-compress</artifactId>
-      <version>1.4</version>
     </dependency>
   </dependencies>
 
@@ -308,6 +305,8 @@
               <goal>protoc</goal>
             </goals>
             <configuration>
+              <protocVersion>${protobuf.version}</protocVersion>
+              <protocCommand>${protoc.path}</protocCommand>
               <imports>
                 <param>${basedir}/src/main/proto</param>
               </imports>
@@ -336,6 +335,8 @@
               <goal>protoc</goal>
             </goals>
             <configuration>
+              <protocVersion>${protobuf.version}</protocVersion>
+              <protocCommand>${protoc.path}</protocCommand>
               <imports>
                 <param>${basedir}/src/test/proto</param>
               </imports>
@@ -463,6 +464,10 @@
             <exclude>src/main/native/src/org/apache/hadoop/io/compress/lz4/lz4hc.c</exclude>
             <exclude>src/main/native/src/org/apache/hadoop/io/compress/lz4/lz4hc_encoder.h</exclude>
             <exclude>src/test/java/org/apache/hadoop/fs/test-untar.tgz</exclude>
+            <exclude>src/test/resources/test.har/_SUCCESS</exclude>
+            <exclude>src/test/resources/test.har/_index</exclude>
+            <exclude>src/test/resources/test.har/_masterindex</exclude>
+            <exclude>src/test/resources/test.har/part-0</exclude>
           </excludes>
         </configuration>
       </plugin>
@@ -586,6 +591,13 @@
           <family>Windows</family>
         </os>
       </activation>
+      <properties>
+        <snappy.prefix></snappy.prefix>
+        <snappy.lib></snappy.lib>
+        <snappy.include></snappy.include>
+        <require.snappy>false</require.snappy>
+        <bundle.snappy.in.bin>true</bundle.snappy.in.bin>
+      </properties>
       <build>
         <plugins>
           <plugin>
@@ -670,6 +682,10 @@
                     <argument>/nologo</argument>
                     <argument>/p:Configuration=Release</argument>
                     <argument>/p:OutDir=${project.build.directory}/bin/</argument>
+                    <argument>/p:CustomSnappyPrefix=${snappy.prefix}</argument>
+                    <argument>/p:CustomSnappyLib=${snappy.lib}</argument>
+                    <argument>/p:CustomSnappyInclude=${snappy.include}</argument>
+                    <argument>/p:RequireSnappy=${require.snappy}</argument>
                   </arguments>
                 </configuration>
               </execution>
@@ -767,9 +783,7 @@
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-surefire-plugin</artifactId>
             <configuration>
-              <forkMode>perthread</forkMode>
-              <threadCount>${testsThreadCount}</threadCount>
-              <parallel>classes</parallel>
+              <forkCount>${testsThreadCount}</forkCount>
               <argLine>-Xmx1024m -XX:+HeapDumpOnOutOfMemoryError -DminiClusterDedicatedDirs=true</argLine>
             </configuration>
           </plugin>

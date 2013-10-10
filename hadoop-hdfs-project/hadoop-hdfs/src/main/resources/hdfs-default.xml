@@ -52,6 +52,18 @@
 </property>
 
 <property>
+  <name>dfs.namenode.rpc-bind-host</name>
+  <value></value>
+  <description>
+    The actual address the server will bind to. If this optional address is
+    set, the RPC server will bind to this address and the port specified in
+    dfs.namenode.rpc-address for the RPC server. It can also be specified
+    per name node or name service for HA/Federation. This is most useful for
+    making name node listen to all interfaces by setting to 0.0.0.0.
+  </description>
+</property>
+
+<property>
   <name>dfs.namenode.servicerpc-address</name>
   <value></value>
   <description>
@@ -61,6 +73,18 @@
     dfs.namenode.rpc-address.EXAMPLENAMESERVICE
     The value of this property will take the form of nn-host1:rpc-port.
     If the value of this property is unset the value of dfs.namenode.rpc-address will be used as the default.
+  </description>
+</property>
+
+<property>
+  <name>dfs.namenode.servicerpc-bind-host</name>
+  <value></value>
+  <description>
+    The actual address the server will bind to. If this optional address is
+    set, the service RPC server will bind to this address and the port 
+    specified in dfs.namenode.servicerpc-address. It can also be specified
+    per name node or name service for HA/Federation. This is most useful for
+    making name node listen to all interfaces by setting to 0.0.0.0.
   </description>
 </property>
 
@@ -1391,4 +1415,32 @@
 	  linearly increases.
 	</description>
 </property>
+
+<property>
+  <name>dfs.client.mmap.cache.size</name>
+  <value>1024</value>
+  <description>
+    When zero-copy reads are used, the DFSClient keeps a cache of recently used
+    memory mapped regions.  This parameter controls the maximum number of
+    entries that we will keep in that cache.
+
+    If this is set to 0, we will not allow mmap.
+
+    The larger this number is, the more file descriptors we will potentially
+    use for memory-mapped files.  mmaped files also use virtual address space.
+    You may need to increase your ulimit virtual address space limits before
+    increasing the client mmap cache size.
+  </description>
+</property>
+
+<property>
+  <name>dfs.client.mmap.cache.timeout.ms</name>
+  <value>900000</value>
+  <description>
+    The minimum length of time that we will keep an mmap entry in the cache
+    between uses.  If an entry is in the cache longer than this, and nobody
+    uses it, it will be removed by a background thread.
+  </description>
+</property>
+
 </configuration>

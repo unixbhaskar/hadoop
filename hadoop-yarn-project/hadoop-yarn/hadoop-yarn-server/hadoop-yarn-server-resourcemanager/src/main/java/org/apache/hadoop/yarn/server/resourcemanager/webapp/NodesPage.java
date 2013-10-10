@@ -76,6 +76,7 @@ class NodesPage extends RmView {
           th(".containers", "Containers").
           th(".mem", "Mem Used").
           th(".mem", "Mem Avail").
+          th(".nodeManagerVersion", "Version").
           _()._().
           tbody();
       NodeState stateFilter = null;
@@ -129,6 +130,7 @@ class NodesPage extends RmView {
               _(StringUtils.byteDesc(usedMemory * BYTES_IN_MB))._().
             td().br().$title(String.valueOf(usedMemory))._().
               _(StringUtils.byteDesc(availableMemory * BYTES_IN_MB))._().
+            td(ni.getNodeManagerVersion()).
             _();
       }
       tbody._()._();
@@ -155,10 +157,10 @@ class NodesPage extends RmView {
 
   private String nodesTableInit() {
     StringBuilder b = tableInit().append(", aoColumnDefs: [");
-    b.append("{'bSearchable': false, 'aTargets': [ 7 ]}");
+    b.append("{'bSearchable': false, 'aTargets': [ 6 ]}");
     b.append(", {'sType': 'title-numeric', 'bSearchable': false, " +
-    		"'aTargets': [ 8, 9 ] }");
-    b.append(", {'sType': 'title-numeric', 'aTargets': [ 5 ]}");
+        "'aTargets': [ 7, 8 ] }");
+    b.append(", {'sType': 'title-numeric', 'aTargets': [ 4 ]}");
     b.append("]}");
     return b.toString();
   }

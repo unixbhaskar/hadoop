@@ -20,8 +20,8 @@ package org.apache.hadoop.yarn.applications.distributedshell;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,9 +40,13 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.DataOutputBuffer;
+import org.apache.hadoop.security.Credentials;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
-import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationRequest;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
@@ -121,8 +125,7 @@ public class Client {
   // Application master jar file
   private String appMasterJar = ""; 
   // Main class to invoke application master
-  private final String appMasterMainClass =
-      "org.apache.hadoop.yarn.applications.distributedshell.ApplicationMaster";
+  private final String appMasterMainClass;
 
   // Shell command to be executed 
   private String shellCommand = ""; 
@@ -189,8 +192,14 @@ public class Client {
   /**
    */
   public Client(Configuration conf) throws Exception  {
-    
+    this(
+      "org.apache.hadoop.yarn.applications.distributedshell.ApplicationMaster",
+      conf);
+  }
+
+  Client(String appMasterMainClass, Configuration conf) {
     this.conf = conf;
+    this.appMasterMainClass = appMasterMainClass;
     yarnClient = YarnClient.createYarnClient();
     yarnClient.init(conf);
     opts = new Options();
@@ -210,6 +219,7 @@ public class Client {
     opts.addOption("log_properties", true, "log4j.properties file");
     opts.addOption("debug", false, "Dump out debug information");
     opts.addOption("help", false, "Print usage");
+
   }
 
   /**
@@ -543,8 +553,28 @@ public class Client {
     // Not needed in this scenario
     // amContainer.setServiceData(serviceData);
 
-    // The following are not required for launching an application master 
-    // amContainer.setContainerId(containerId);		
+    // Setup security tokens
+    if (UserGroupInformation.isSecurityEnabled()) {
+      Credentials credentials = new Credentials();
+      String tokenRenewer = conf.get(YarnConfiguration.RM_PRINCIPAL);
+      if (tokenRenewer == null || tokenRenewer.length() == 0) {
+        throw new IOException(
+          "Can't get Master Kerberos principal for the RM to use as renewer");
+      }
+
+      // For now, only getting tokens for the default file-system.
+      final Token<?> tokens[] =
+          fs.addDelegationTokens(tokenRenewer, credentials);
+      if (tokens != null) {
+        for (Token<?> token : tokens) {
+          LOG.info("Got dt for " + fs.getUri() + "; " + token);
+        }
+      }
+      DataOutputBuffer dob = new DataOutputBuffer();
+      credentials.writeTokenStorageToStream(dob);
+      ByteBuffer fsTokens = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
+      amContainer.setTokens(fsTokens);
+    }
 
     appContext.setAMContainerSpec(amContainer);
 

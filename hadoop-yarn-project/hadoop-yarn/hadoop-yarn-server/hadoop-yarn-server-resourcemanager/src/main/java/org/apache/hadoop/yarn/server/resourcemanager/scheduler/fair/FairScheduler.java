@@ -35,10 +35,8 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
-import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerId;
@@ -51,6 +49,7 @@ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
@@ -122,6 +121,7 @@ public class FairScheduler implements ResourceScheduler {
   private Resource incrAllocation;
   private QueueManager queueMgr;
   private Clock clock;
+  private boolean usePortForNodeName;
 
   private static final Log LOG = LogFactory.getLog(FairScheduler.class);
   
@@ -154,8 +154,9 @@ public class FairScheduler implements ResourceScheduler {
 
   // This stores per-application scheduling information, indexed by
   // attempt ID's for fast lookup.
+  @VisibleForTesting
   protected Map<ApplicationAttemptId, FSSchedulerApp> applications = 
-      new HashMap<ApplicationAttemptId, FSSchedulerApp>();
+      new ConcurrentHashMap<ApplicationAttemptId, FSSchedulerApp>();
 
   // Nodes in the cluster, indexed by NodeId
   private Map<NodeId, FSSchedulerNode> nodes = 
@@ -178,8 +179,12 @@ public class FairScheduler implements ResourceScheduler {
   protected boolean preemptionEnabled;
   protected boolean sizeBasedWeight; // Give larger weights to larger jobs
   protected WeightAdjuster weightAdjuster; // Can be null for no weight adjuster
+  protected boolean continuousSchedulingEnabled; // Continuous Scheduling enabled or not
+  protected int continuousSchedulingSleepMs; // Sleep time for each pass in continuous scheduling
   protected double nodeLocalityThreshold; // Cluster threshold for node locality
   protected double rackLocalityThreshold; // Cluster threshold for rack locality
+  protected long nodeLocalityDelayMs; // Delay for node locality
+  protected long rackLocalityDelayMs; // Delay for rack locality
   private FairSchedulerEventLog eventLog; // Machine-readable event log
   protected boolean assignMultiple; // Allocate multiple containers per
                                     // heartbeat
@@ -385,8 +390,8 @@ public class FairScheduler implements ResourceScheduler {
     // Sort containers into reverse order of priority
     Collections.sort(runningContainers, new Comparator<RMContainer>() {
       public int compare(RMContainer c1, RMContainer c2) {
-        int ret = c2.getContainer().getPriority().compareTo(
-            c1.getContainer().getPriority());
+        int ret = c1.getContainer().getPriority().compareTo(
+            c2.getContainer().getPriority());
         if (ret == 0) {
           return c2.getContainerId().compareTo(c1.getContainerId());
         }
@@ -444,7 +449,7 @@ public class FairScheduler implements ResourceScheduler {
       // proceed with kill
       if (time + waitTimeBeforeKill < clock.getTime()) {
         ContainerStatus status =
-          SchedulerUtils.createAbnormalContainerStatus(
+          SchedulerUtils.createPreemptedContainerStatus(
             container.getContainerId(), SchedulerUtils.PREEMPTED_CONTAINER);
 
         // TODO: Not sure if this ever actually adds this to the list of cleanup
@@ -581,6 +586,22 @@ public class FairScheduler implements ResourceScheduler {
     return rackLocalityThreshold;
   }
 
+  public long getNodeLocalityDelayMs() {
+    return nodeLocalityDelayMs;
+  }
+
+  public long getRackLocalityDelayMs() {
+    return rackLocalityDelayMs;
+  }
+
+  public boolean isContinuousSchedulingEnabled() {
+    return continuousSchedulingEnabled;
+  }
+
+  public synchronized int getContinuousSchedulingSleepMs() {
+    return continuousSchedulingSleepMs;
+  }
+
   public Resource getClusterCapacity() {
     return clusterCapacity;
   }
@@ -613,7 +634,8 @@ public class FairScheduler implements ResourceScheduler {
       return;
     }
 
-    RMApp rmApp = rmContext.getRMApps().get(applicationAttemptId);
+    RMApp rmApp = rmContext.getRMApps().get(
+        applicationAttemptId.getApplicationId());
     FSLeafQueue queue = assignToQueue(rmApp, queueName, user);
 
     FSSchedulerApp schedulerApp =
@@ -623,7 +645,9 @@ public class FairScheduler implements ResourceScheduler {
 
     // Enforce ACLs
     UserGroupInformation userUgi = UserGroupInformation.createRemoteUser(user);
-    if (!queue.hasAccess(QueueACL.SUBMIT_APPLICATIONS, userUgi)) {
+
+    if (!queue.hasAccess(QueueACL.SUBMIT_APPLICATIONS, userUgi)
+        && !queue.hasAccess(QueueACL.ADMINISTER_QUEUE, userUgi)) {
       String msg = "User " + userUgi.getUserName() +
     	        " cannot submit applications to queue " + queue.getName();
       LOG.info(msg);
@@ -631,7 +655,7 @@ public class FairScheduler implements ResourceScheduler {
     	        new RMAppAttemptRejectedEvent(applicationAttemptId, msg));
       return;
     }
-    
+
     queue.addApp(schedulerApp);
     queue.getMetrics().submitApp(user, applicationAttemptId.getAttemptId());
 
@@ -654,14 +678,17 @@ public class FairScheduler implements ResourceScheduler {
       queueName = user;
     }
     
-    FSLeafQueue queue = queueMgr.getLeafQueue(queueName);
+    FSLeafQueue queue = queueMgr.getLeafQueue(queueName,
+        conf.getAllowUndeclaredPools());
     if (queue == null) {
       // queue is not an existing or createable leaf queue
-      queue = queueMgr.getLeafQueue(YarnConfiguration.DEFAULT_QUEUE_NAME);
+      queue = queueMgr.getLeafQueue(YarnConfiguration.DEFAULT_QUEUE_NAME, false);
     }
     
     if (rmApp != null) {
       rmApp.setQueue(queue.getName());
+    } else {
+      LOG.warn("Couldn't find RM app to set queue name on");
     }
     
     return queue;
@@ -703,7 +730,7 @@ public class FairScheduler implements ResourceScheduler {
 
     // Inform the queue
     FSLeafQueue queue = queueMgr.getLeafQueue(application.getQueue()
-        .getQueueName());
+        .getQueueName(), false);
     queue.removeApp(application);
 
     // Remove from our data-structure
@@ -751,7 +778,7 @@ public class FairScheduler implements ResourceScheduler {
   }
 
   private synchronized void addNode(RMNode node) {
-    nodes.put(node.getNodeID(), new FSSchedulerNode(node));
+    nodes.put(node.getNodeID(), new FSSchedulerNode(node, usePortForNodeName));
     Resources.addTo(clusterCapacity, node.getTotalCapability());
     updateRootQueueMetrics();
 
@@ -904,6 +931,37 @@ public class FairScheduler implements ResourceScheduler {
           completedContainer, RMContainerEventType.FINISHED);
     }
 
+    if (continuousSchedulingEnabled) {
+      if (!completedContainers.isEmpty()) {
+        attemptScheduling(node);
+      }
+    } else {
+      attemptScheduling(node);
+    }
+  }
+
+  private void continuousScheduling() {
+    while (true) {
+      for (FSSchedulerNode node : nodes.values()) {
+        try {
+          if (Resources.fitsIn(minimumAllocation, node.getAvailableResource())) {
+            attemptScheduling(node);
+          }
+        } catch (Throwable ex) {
+          LOG.warn("Error while attempting scheduling for node " + node + ": " +
+                  ex.toString(), ex);
+        }
+      }
+      try {
+        Thread.sleep(getContinuousSchedulingSleepMs());
+      } catch (InterruptedException e) {
+        LOG.warn("Error while doing sleep in continuous scheduling: " +
+                e.toString(), e);
+      }
+    }
+  }
+  
+  private synchronized void attemptScheduling(FSSchedulerNode node) {
     // Assign new containers...
     // 1. Check for reserved applications
     // 2. Schedule if there are no reservations
@@ -911,19 +969,18 @@ public class FairScheduler implements ResourceScheduler {
     AppSchedulable reservedAppSchedulable = node.getReservedAppSchedulable();
     if (reservedAppSchedulable != null) {
       Priority reservedPriority = node.getReservedContainer().getReservedPriority();
-      if (reservedAppSchedulable != null &&
-          !reservedAppSchedulable.hasContainerForNode(reservedPriority, node)) {
+      if (!reservedAppSchedulable.hasContainerForNode(reservedPriority, node)) {
         // Don't hold the reservation if app can no longer use it
         LOG.info("Releasing reservation that cannot be satisfied for application "
             + reservedAppSchedulable.getApp().getApplicationAttemptId()
-            + " on node " + nm);
+            + " on node " + node);
         reservedAppSchedulable.unreserve(reservedPriority, node);
         reservedAppSchedulable = null;
       } else {
         // Reservation exists; try to fulfill the reservation
         LOG.info("Trying to fulfill reservation for application "
             + reservedAppSchedulable.getApp().getApplicationAttemptId()
-            + " on node: " + nm);
+            + " on node: " + node);
 
         node.getReservedAppSchedulable().assignReservedContainer(node);
       }
@@ -1057,15 +1114,21 @@ public class FairScheduler implements ResourceScheduler {
     maximumAllocation = this.conf.getMaximumAllocation();
     incrAllocation = this.conf.getIncrementAllocation();
     userAsDefaultQueue = this.conf.getUserAsDefaultQueue();
+    continuousSchedulingEnabled = this.conf.isContinuousSchedulingEnabled();
+    continuousSchedulingSleepMs =
+            this.conf.getContinuousSchedulingSleepMs();
     nodeLocalityThreshold = this.conf.getLocalityThresholdNode();
     rackLocalityThreshold = this.conf.getLocalityThresholdRack();
+    nodeLocalityDelayMs = this.conf.getLocalityDelayNodeMs();
+    rackLocalityDelayMs = this.conf.getLocalityDelayRackMs();
     preemptionEnabled = this.conf.getPreemptionEnabled();
     assignMultiple = this.conf.getAssignMultiple();
     maxAssign = this.conf.getMaxAssign();
     sizeBasedWeight = this.conf.getSizeBasedWeight();
     preemptionInterval = this.conf.getPreemptionInterval();
     waitTimeBeforeKill = this.conf.getWaitTimeBeforeKill();
-
+    usePortForNodeName = this.conf.getUsePortForNodeName();
+    
     if (!initialized) {
       rootMetrics = FSQueueMetrics.forQueue("root", null, true, conf);
       this.rmContext = rmContext;
@@ -1084,6 +1147,21 @@ public class FairScheduler implements ResourceScheduler {
       updateThread.setName("FairSchedulerUpdateThread");
       updateThread.setDaemon(true);
       updateThread.start();
+
+      if (continuousSchedulingEnabled) {
+        // start continuous scheduling thread
+        Thread schedulingThread = new Thread(
+          new Runnable() {
+            @Override
+            public void run() {
+              continuousScheduling();
+            }
+          }
+        );
+        schedulingThread.setName("ContinuousScheduling");
+        schedulingThread.setDaemon(true);
+        schedulingThread.start();
+      }
     } else {
       try {
         queueMgr.reloadAllocs();
@@ -1118,6 +1196,20 @@ public class FairScheduler implements ResourceScheduler {
   @Override
   public int getNumClusterNodes() {
     return nodes.size();
+  }
+
+  @Override
+  public synchronized boolean checkAccess(UserGroupInformation callerUGI,
+      QueueACL acl, String queueName) {
+    FSQueue queue = getQueueManager().getQueue(queueName);
+    if (queue == null) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("ACL not found for queue access-type " + acl
+            + " for queue " + queueName);
+      }
+      return false;
+    }
+    return queue.hasAccess(acl, callerUGI);
   }
 
 }

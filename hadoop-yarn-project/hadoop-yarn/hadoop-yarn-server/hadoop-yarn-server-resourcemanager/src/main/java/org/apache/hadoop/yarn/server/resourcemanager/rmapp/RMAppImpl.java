@@ -18,7 +18,6 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.rmapp;
 
-import java.io.IOException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -55,8 +54,10 @@ import org.apache.hadoop.yarn.server.resourcemanager.ApplicationMasterService;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEventType;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+import org.apache.hadoop.yarn.server.resourcemanager.RMServerUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.RMState;
+import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.Recoverable;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppNodeUpdateEvent.RMAppNodeUpdateType;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
@@ -110,6 +111,8 @@ public class RMAppImpl implements RMApp, Recoverable {
   private static final FinalTransition FINAL_TRANSITION = new FinalTransition();
   private static final AppFinishedTransition FINISHED_TRANSITION =
       new AppFinishedTransition();
+  private boolean isAppRemovalRequestSent = false;
+  private RMAppState previousStateAtRemoving;
 
   private static final StateMachineFactory<RMAppImpl,
                                            RMAppState,
@@ -168,8 +171,9 @@ public class RMAppImpl implements RMApp, Recoverable {
      // Transitions from RUNNING state
     .addTransition(RMAppState.RUNNING, RMAppState.RUNNING,
         RMAppEventType.NODE_UPDATE, new RMAppNodeUpdateTransition())
-    .addTransition(RMAppState.RUNNING, RMAppState.FINISHING,
-        RMAppEventType.ATTEMPT_FINISHING, new RMAppFinishingTransition())
+    .addTransition(RMAppState.RUNNING, RMAppState.REMOVING,
+          RMAppEventType.ATTEMPT_UNREGISTERED,
+        new RMAppRemovingTransition())
     .addTransition(RMAppState.RUNNING, RMAppState.FINISHED,
         RMAppEventType.ATTEMPT_FINISHED, FINISHED_TRANSITION)
     .addTransition(RMAppState.RUNNING,
@@ -179,6 +183,17 @@ public class RMAppImpl implements RMApp, Recoverable {
     .addTransition(RMAppState.RUNNING, RMAppState.KILLED,
         RMAppEventType.KILL, new KillAppAndAttemptTransition())
 
+     // Transitions from REMOVING state
+    .addTransition(RMAppState.REMOVING, RMAppState.FINISHING,
+        RMAppEventType.APP_REMOVED,  new RMAppFinishingTransition())
+    .addTransition(RMAppState.REMOVING, RMAppState.FINISHED,
+        RMAppEventType.ATTEMPT_FINISHED, FINISHED_TRANSITION)
+    .addTransition(RMAppState.REMOVING, RMAppState.KILLED,
+        RMAppEventType.KILL, new KillAppAndAttemptTransition())
+    // ignorable transitions
+    .addTransition(RMAppState.REMOVING, RMAppState.REMOVING,
+        RMAppEventType.NODE_UPDATE)
+
      // Transitions from FINISHING state
     .addTransition(RMAppState.FINISHING, RMAppState.FINISHED,
         RMAppEventType.ATTEMPT_FINISHED, FINISHED_TRANSITION)
@@ -186,36 +201,34 @@ public class RMAppImpl implements RMApp, Recoverable {
         RMAppEventType.KILL, new KillAppAndAttemptTransition())
     // ignorable transitions
     .addTransition(RMAppState.FINISHING, RMAppState.FINISHING,
-        RMAppEventType.NODE_UPDATE)
+      EnumSet.of(RMAppEventType.NODE_UPDATE, RMAppEventType.APP_REMOVED))
 
      // Transitions from FINISHED state
-    .addTransition(RMAppState.FINISHED, RMAppState.FINISHED,
-        RMAppEventType.KILL)
      // ignorable transitions
     .addTransition(RMAppState.FINISHED, RMAppState.FINISHED,
         EnumSet.of(
             RMAppEventType.NODE_UPDATE,
-            RMAppEventType.ATTEMPT_FINISHING,
-            RMAppEventType.ATTEMPT_FINISHED))
+            RMAppEventType.ATTEMPT_UNREGISTERED,
+            RMAppEventType.ATTEMPT_FINISHED,
+            RMAppEventType.KILL,
+            RMAppEventType.APP_REMOVED))
 
      // Transitions from FAILED state
-    .addTransition(RMAppState.FAILED, RMAppState.FAILED,
-        EnumSet.of(RMAppEventType.KILL, RMAppEventType.APP_SAVED))
      // ignorable transitions
-    .addTransition(RMAppState.FAILED, RMAppState.FAILED, 
-        RMAppEventType.NODE_UPDATE)
+    .addTransition(RMAppState.FAILED, RMAppState.FAILED,
+        EnumSet.of(RMAppEventType.KILL, RMAppEventType.NODE_UPDATE,
+          RMAppEventType.APP_SAVED, RMAppEventType.APP_REMOVED))
 
      // Transitions from KILLED state
+     // ignorable transitions
     .addTransition(
         RMAppState.KILLED,
         RMAppState.KILLED,
         EnumSet.of(RMAppEventType.APP_ACCEPTED,
             RMAppEventType.APP_REJECTED, RMAppEventType.KILL,
             RMAppEventType.ATTEMPT_FINISHED, RMAppEventType.ATTEMPT_FAILED,
-            RMAppEventType.ATTEMPT_KILLED, RMAppEventType.APP_SAVED))
-     // ignorable transitions
-    .addTransition(RMAppState.KILLED, RMAppState.KILLED,
-        RMAppEventType.NODE_UPDATE)
+            RMAppEventType.ATTEMPT_KILLED, RMAppEventType.NODE_UPDATE,
+            RMAppEventType.APP_SAVED, RMAppEventType.APP_REMOVED))
 
      .installTopology();
 
@@ -378,29 +391,6 @@ public class RMAppImpl implements RMApp, Recoverable {
     }
   }
 
-  private YarnApplicationState createApplicationState(RMAppState rmAppState) {
-    switch(rmAppState) {
-    case NEW:
-      return YarnApplicationState.NEW;
-    case NEW_SAVING:
-      return YarnApplicationState.NEW_SAVING;
-    case SUBMITTED:
-      return YarnApplicationState.SUBMITTED;
-    case ACCEPTED:
-      return YarnApplicationState.ACCEPTED;
-    case RUNNING:
-      return YarnApplicationState.RUNNING;
-    case FINISHING:
-    case FINISHED:
-      return YarnApplicationState.FINISHED;
-    case KILLED:
-      return YarnApplicationState.KILLED;
-    case FAILED:
-      return YarnApplicationState.FAILED;
-    }
-    throw new YarnRuntimeException("Unknown state passed!");
-  }
-
   private FinalApplicationStatus createFinalApplicationStatus(RMAppState state) {
     switch(state) {
     case NEW:
@@ -408,6 +398,7 @@ public class RMAppImpl implements RMApp, Recoverable {
     case SUBMITTED:
     case ACCEPTED:
     case RUNNING:
+    case REMOVING:
       return FinalApplicationStatus.UNDEFINED;    
     // finished without a proper final state is the same as failed  
     case FINISHING:
@@ -434,7 +425,8 @@ public class RMAppImpl implements RMApp, Recoverable {
   }
   
   @Override
-  public ApplicationReport createAndGetApplicationReport(boolean allowAccess) {
+  public ApplicationReport createAndGetApplicationReport(String clientUserName,
+      boolean allowAccess) {
     this.readLock.lock();
 
     try {
@@ -455,15 +447,18 @@ public class RMAppImpl implements RMApp, Recoverable {
           currentApplicationAttemptId = this.currentAttempt.getAppAttemptId();
           trackingUrl = this.currentAttempt.getTrackingUrl();
           origTrackingUrl = this.currentAttempt.getOriginalTrackingUrl();
-          Token<ClientToAMTokenIdentifier> attemptClientToAMToken =
-              this.currentAttempt.getClientToAMToken();
-          if (attemptClientToAMToken != null) {
-            clientToAMToken =
-                BuilderUtils.newClientToAMToken(
-                    attemptClientToAMToken.getIdentifier(),
-                    attemptClientToAMToken.getKind().toString(),
-                    attemptClientToAMToken.getPassword(),
-                    attemptClientToAMToken.getService().toString());
+          if (UserGroupInformation.isSecurityEnabled()) {
+            // get a token so the client can communicate with the app attempt
+            // NOTE: token may be unavailable if the attempt is not running
+            Token<ClientToAMTokenIdentifier> attemptClientToAMToken =
+                this.currentAttempt.createClientToken(clientUserName);
+            if (attemptClientToAMToken != null) {
+              clientToAMToken = BuilderUtils.newClientToAMToken(
+                  attemptClientToAMToken.getIdentifier(),
+                  attemptClientToAMToken.getKind().toString(),
+                  attemptClientToAMToken.getPassword(),
+                  attemptClientToAMToken.getService().toString());
+            }
           }
           host = this.currentAttempt.getHost();
           rpcPort = this.currentAttempt.getRpcPort();
@@ -474,20 +469,15 @@ public class RMAppImpl implements RMApp, Recoverable {
 
         if (currentAttempt != null && 
             currentAttempt.getAppAttemptState() == RMAppAttemptState.LAUNCHED) {
-          try {
-            if (getApplicationSubmissionContext().getUnmanagedAM() &&
-              getUser().equals(UserGroupInformation.getCurrentUser().getUserName())) {
-              Token<AMRMTokenIdentifier> token = currentAttempt.getAMRMToken();
-              if (token != null) {
-                amrmToken = BuilderUtils.newAMRMToken(token.getIdentifier(),
-                    token.getKind().toString(), token.getPassword(),
-                    token.getService().toString());
-              }
+          if (getApplicationSubmissionContext().getUnmanagedAM() &&
+              clientUserName != null && getUser().equals(clientUserName)) {
+            Token<AMRMTokenIdentifier> token = currentAttempt.getAMRMToken();
+            if (token != null) {
+              amrmToken = BuilderUtils.newAMRMToken(token.getIdentifier(),
+                  token.getKind().toString(), token.getPassword(),
+                  token.getService().toString());
             }
-          } catch (IOException ex) {
-            LOG.warn("UserGroupInformation.getCurrentUser() error: " + 
-              ex.toString(), ex);
-          }          
+          }
         }
       }
 
@@ -500,7 +490,7 @@ public class RMAppImpl implements RMApp, Recoverable {
       return BuilderUtils.newApplicationReport(this.applicationId,
           currentApplicationAttemptId, this.user, this.queue,
           this.name, host, rpcPort, clientToAMToken,
-          createApplicationState(this.stateMachine.getCurrentState()), diags,
+          createApplicationState(), diags,
           trackingUrl, this.startTime, this.finishTime, finishState,
           appUsageReport, origTrackingUrl, progress, this.applicationType, 
           amrmToken);
@@ -594,7 +584,7 @@ public class RMAppImpl implements RMApp, Recoverable {
   }
   
   @Override
-  public void recover(RMState state) {
+  public void recover(RMState state) throws Exception{
     ApplicationState appState = state.getApplicationState().get(getApplicationId());
     LOG.info("Recovering app: " + getApplicationId() + " with " + 
             + appState.getAttemptCount() + " attempts");
@@ -662,10 +652,18 @@ public class RMAppImpl implements RMApp, Recoverable {
     };
   }
 
-  private static final class RMAppFinishingTransition extends
-      RMAppTransition {
+  private static final class RMAppFinishingTransition extends RMAppTransition {
     @Override
     public void transition(RMAppImpl app, RMAppEvent event) {
+      if (event.getType().equals(RMAppEventType.APP_REMOVED)) {
+        RMAppRemovedEvent removeEvent = (RMAppRemovedEvent) event;
+        if (removeEvent.getRemovedException() != null) {
+          LOG.error(
+            "Failed to remove application: " + removeEvent.getApplicationId(),
+            removeEvent.getRemovedException());
+          ExitUtil.terminate(1, removeEvent.getRemovedException());
+        }
+      }
       app.finishTime = System.currentTimeMillis();
     }
   }
@@ -679,6 +677,15 @@ public class RMAppImpl implements RMApp, Recoverable {
       // communication
       LOG.info("Storing application with id " + app.applicationId);
       app.rmContext.getStateStore().storeApplication(app);
+    }
+  }
+
+  private static final class RMAppRemovingTransition extends RMAppTransition {
+    @Override
+    public void transition(RMAppImpl app, RMAppEvent event) {
+      LOG.info("Removing application with id " + app.applicationId);
+      app.removeApplicationState();
+      app.previousStateAtRemoving = app.getState();
     }
   }
 
@@ -737,6 +744,9 @@ public class RMAppImpl implements RMApp, Recoverable {
       if (app.getState() != RMAppState.FINISHING) {
         app.finishTime = System.currentTimeMillis();
       }
+      // application completely done and remove from state store.
+      app.removeApplicationState();
+
       app.handler.handle(
           new RMAppManagerEvent(app.applicationId,
           RMAppManagerEventType.APP_COMPLETED));
@@ -788,5 +798,53 @@ public class RMAppImpl implements RMApp, Recoverable {
   @Override
   public String getApplicationType() {
     return this.applicationType;
+  }
+
+  @Override
+  public boolean isAppSafeToUnregister() {
+    RMAppState state = getState();
+    return state.equals(RMAppState.FINISHING)
+        || state.equals(RMAppState.FINISHED) || state.equals(RMAppState.FAILED)
+        || state.equals(RMAppState.KILLED) ||
+        // If this is an unmanaged AM, we are safe to unregister since unmanaged
+        // AM will immediately go to FINISHED state on AM unregistration
+        getApplicationSubmissionContext().getUnmanagedAM();
+  }
+
+  @Override
+  public YarnApplicationState createApplicationState() {
+    RMAppState rmAppState = getState();
+    // If App is in REMOVING state, return its previous state.
+    if (rmAppState.equals(RMAppState.REMOVING)) {
+      rmAppState = previousStateAtRemoving;
+    }
+    switch (rmAppState) {
+    case NEW:
+      return YarnApplicationState.NEW;
+    case NEW_SAVING:
+      return YarnApplicationState.NEW_SAVING;
+    case SUBMITTED:
+      return YarnApplicationState.SUBMITTED;
+    case ACCEPTED:
+      return YarnApplicationState.ACCEPTED;
+    case RUNNING:
+      return YarnApplicationState.RUNNING;
+    case FINISHING:
+    case FINISHED:
+      return YarnApplicationState.FINISHED;
+    case KILLED:
+      return YarnApplicationState.KILLED;
+    case FAILED:
+      return YarnApplicationState.FAILED;
+    default:
+      throw new YarnRuntimeException("Unknown state passed!");
+    }
+  }
+
+  private void removeApplicationState(){
+    if (!isAppRemovalRequestSent) {
+      rmContext.getStateStore().removeApplication(this);
+      isAppRemovalRequestSent = true;
+    }
   }
 }

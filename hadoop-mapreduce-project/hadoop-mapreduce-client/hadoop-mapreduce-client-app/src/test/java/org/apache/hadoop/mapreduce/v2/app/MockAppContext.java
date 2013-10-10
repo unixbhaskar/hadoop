@@ -130,4 +130,16 @@ public class MockAppContext implements AppContext {
     // Not implemented
     return null;
   }
+
+  @Override
+  public boolean isLastAMRetry() {
+    return false;
+  }
+
+  @Override
+  public boolean hasSuccessfullyUnregistered() {
+    // bogus - Not Required
+    return true;
+  }
+
 }

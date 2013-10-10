@@ -51,7 +51,7 @@ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifie
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
 import org.apache.hadoop.hdfs.server.common.JspHelper;
 import org.apache.hadoop.hdfs.tools.DelegationTokenFetcher;
-import org.apache.hadoop.hdfs.web.URLUtils;
+import org.apache.hadoop.hdfs.web.URLConnectionFactory;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.net.NetUtils;
@@ -86,13 +86,14 @@ public class HftpFileSystem extends FileSystem
     HttpURLConnection.setFollowRedirects(true);
   }
 
+  URLConnectionFactory connectionFactory = URLConnectionFactory.DEFAULT_CONNECTION_FACTORY;
+
   public static final Text TOKEN_KIND = new Text("HFTP delegation");
 
   protected UserGroupInformation ugi;
   private URI hftpURI;
 
   protected URI nnUri;
-  protected URI nnSecureUri;
 
   public static final String HFTP_TIMEZONE = "UTC";
   public static final String HFTP_DATE_FORMAT = "yyyy-MM-dd'T'HH:mm:ssZ";
@@ -132,34 +133,33 @@ public class HftpFileSystem extends FileSystem
         DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT);
   }
 
-  protected int getDefaultSecurePort() {
-    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_KEY,
-        DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_DEFAULT);
-  }
-
+  /**
+   *  We generate the address with one of the following ports, in
+   *  order of preference.
+   *  1. Port from the hftp URI e.g. hftp://namenode:4000/ will return 4000.
+   *  2. Port configured via DFS_NAMENODE_HTTP_PORT_KEY
+   *  3. DFS_NAMENODE_HTTP_PORT_DEFAULT i.e. 50070.
+   *
+   * @param uri
+   * @return
+   */
   protected InetSocketAddress getNamenodeAddr(URI uri) {
     // use authority so user supplied uri can override port
     return NetUtils.createSocketAddr(uri.getAuthority(), getDefaultPort());
   }
 
-  protected InetSocketAddress getNamenodeSecureAddr(URI uri) {
-    // must only use the host and the configured https port
-    return NetUtils.createSocketAddrForHost(uri.getHost(), getDefaultSecurePort());
-  }
-
   protected URI getNamenodeUri(URI uri) {
-    return DFSUtil.createUri("http", getNamenodeAddr(uri));
+    return DFSUtil.createUri(getUnderlyingProtocol(), getNamenodeAddr(uri));
   }
 
-  protected URI getNamenodeSecureUri(URI uri) {
-    return DFSUtil.createUri("http", getNamenodeSecureAddr(uri));
-  }
-
+  /**
+   * See the documentation of {@Link #getNamenodeAddr(URI)} for the logic
+   * behind selecting the canonical service name.
+   * @return
+   */
   @Override
   public String getCanonicalServiceName() {
-    // unlike other filesystems, hftp's service is the secure port, not the
-    // actual port in the uri
-    return SecurityUtil.buildTokenService(nnSecureUri).toString();
+    return SecurityUtil.buildTokenService(nnUri).toString();
   }
   
   @Override
@@ -185,7 +185,6 @@ public class HftpFileSystem extends FileSystem
     setConf(conf);
     this.ugi = UserGroupInformation.getCurrentUser(); 
     this.nnUri = getNamenodeUri(name);
-    this.nnSecureUri = getNamenodeSecureUri(name);
     try {
       this.hftpURI = new URI(name.getScheme(), name.getAuthority(),
                              null, null, null);
@@ -223,13 +222,20 @@ public class HftpFileSystem extends FileSystem
 
   protected Token<DelegationTokenIdentifier> selectDelegationToken(
       UserGroupInformation ugi) {
-  	return hftpTokenSelector.selectToken(nnSecureUri, ugi.getTokens(), getConf());
+    return hftpTokenSelector.selectToken(nnUri, ugi.getTokens(), getConf());
   }
   
 
   @Override
   public Token<?> getRenewToken() {
     return renewToken;
+  }
+
+  /**
+   * Return the underlying protocol that is used to talk to the namenode.
+   */
+  protected String getUnderlyingProtocol() {
+    return "http";
   }
 
   @Override
@@ -255,7 +261,7 @@ public class HftpFileSystem extends FileSystem
       return ugi.doAs(new PrivilegedExceptionAction<Token<?>>() {
         @Override
         public Token<?> run() throws IOException {
-          final String nnHttpUrl = nnSecureUri.toString();
+          final String nnHttpUrl = nnUri.toString();
           Credentials c;
           try {
             c = DelegationTokenFetcher.getDTfromRemote(nnHttpUrl, renewer);
@@ -299,7 +305,7 @@ public class HftpFileSystem extends FileSystem
    * @throws IOException on error constructing the URL
    */
   protected URL getNamenodeURL(String path, String query) throws IOException {
-    final URL url = new URL("http", nnUri.getHost(),
+    final URL url = new URL(getUnderlyingProtocol(), nnUri.getHost(),
           nnUri.getPort(), path + '?' + query);
     if (LOG.isTraceEnabled()) {
       LOG.trace("url=" + url);
@@ -331,8 +337,8 @@ public class HftpFileSystem extends FileSystem
       throws IOException {
     query = addDelegationTokenParam(query);
     final URL url = getNamenodeURL(path, query);
-    final HttpURLConnection connection =
-        (HttpURLConnection)URLUtils.openConnection(url);
+    final HttpURLConnection connection;
+    connection = (HttpURLConnection)connectionFactory.openConnection(url);
     connection.setRequestMethod("GET");
     connection.connect();
     return connection;
@@ -352,12 +358,14 @@ public class HftpFileSystem extends FileSystem
   }
 
   static class RangeHeaderUrlOpener extends ByteRangeInputStream.URLOpener {
+    URLConnectionFactory connectionFactory = URLConnectionFactory.DEFAULT_CONNECTION_FACTORY;
+    
     RangeHeaderUrlOpener(final URL url) {
       super(url);
     }
 
     protected HttpURLConnection openConnection() throws IOException {
-      return (HttpURLConnection)URLUtils.openConnection(url);
+      return (HttpURLConnection)connectionFactory.openConnection(url);
     }
 
     /** Use HTTP Range header for specifying offset. */
@@ -699,17 +707,20 @@ public class HftpFileSystem extends FileSystem
       return true;
     }
 
+    protected String getUnderlyingProtocol() {
+      return "http";
+    }
+
     @SuppressWarnings("unchecked")
     @Override
     public long renew(Token<?> token, 
                       Configuration conf) throws IOException {
       // update the kerberos credentials, if they are coming from a keytab
       UserGroupInformation.getLoginUser().checkTGTAndReloginFromKeytab();
-      // use http to renew the token
       InetSocketAddress serviceAddr = SecurityUtil.getTokenServiceAddr(token);
       return 
         DelegationTokenFetcher.renewDelegationToken
-        (DFSUtil.createUri("http", serviceAddr).toString(),
+        (DFSUtil.createUri(getUnderlyingProtocol(), serviceAddr).toString(),
          (Token<DelegationTokenIdentifier>) token);
     }
 
@@ -719,10 +730,9 @@ public class HftpFileSystem extends FileSystem
                        Configuration conf) throws IOException {
       // update the kerberos credentials, if they are coming from a keytab
       UserGroupInformation.getLoginUser().checkTGTAndReloginFromKeytab();
-      // use http to cancel the token
       InetSocketAddress serviceAddr = SecurityUtil.getTokenServiceAddr(token);
       DelegationTokenFetcher.cancelDelegationToken
-        (DFSUtil.createUri("http", serviceAddr).toString(),
+        (DFSUtil.createUri(getUnderlyingProtocol(), serviceAddr).toString(),
          (Token<DelegationTokenIdentifier>) token);
     }    
   }

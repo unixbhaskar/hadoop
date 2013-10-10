@@ -30,6 +30,7 @@ import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.token.delegation.DelegationKey;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationAttemptStateDataPBImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationStateDataPBImpl;
@@ -65,7 +66,11 @@ public class MemoryRMStateStore extends RMStateStore {
   @Override
   public synchronized void initInternal(Configuration conf) {
   }
-  
+
+  @Override
+  protected synchronized void startInternal() throws Exception {
+  }
+
   @Override
   protected synchronized void closeInternal() throws Exception {
   }
@@ -104,7 +109,9 @@ public class MemoryRMStateStore extends RMStateStore {
 
     ApplicationState appState = state.getApplicationState().get(
         attemptState.getAttemptId().getApplicationId());
-    assert appState != null;
+    if (appState == null) {
+      throw new YarnRuntimeException("Application doesn't exist");
+    }
 
     if (appState.attempts.containsKey(attemptState.getAttemptId())) {
       Exception e = new IOException("Attempt: " +
@@ -121,7 +128,9 @@ public class MemoryRMStateStore extends RMStateStore {
                                                             throws Exception {
     ApplicationId appId = appState.getAppId();
     ApplicationState removed = state.appState.remove(appId);
-    assert removed != null;
+    if (removed == null) {
+      throw new YarnRuntimeException("Removing non-exsisting application state");
+    }
   }
 
   @Override

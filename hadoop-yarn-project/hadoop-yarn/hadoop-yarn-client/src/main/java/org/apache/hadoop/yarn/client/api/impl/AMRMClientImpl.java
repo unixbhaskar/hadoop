@@ -44,6 +44,7 @@ import org.apache.hadoop.yarn.api.ApplicationMasterProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.FinishApplicationMasterRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.FinishApplicationMasterResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.RegisterApplicationMasterRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.RegisterApplicationMasterResponse;
 import org.apache.hadoop.yarn.api.records.ContainerId;
@@ -51,6 +52,7 @@ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.NMToken;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.ResourceBlacklistRequest;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.client.ClientRMProxy;
 import org.apache.hadoop.yarn.client.api.AMRMClient;
@@ -79,6 +81,9 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
   protected ApplicationMasterProtocol rmClient;
   protected Resource clusterAvailableResources;
   protected int clusterNodeCount;
+  
+  protected final Set<String> blacklistAdditions = new HashSet<String>();
+  protected final Set<String> blacklistRemovals = new HashSet<String>();
   
   class ResourceRequestInfo {
     ResourceRequest remoteRequest;
@@ -161,7 +166,8 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
   protected void serviceStart() throws Exception {
     final YarnConfiguration conf = new YarnConfiguration(getConfig());
     try {
-      rmClient = ClientRMProxy.createRMProxy(conf, ApplicationMasterProtocol.class);
+      rmClient =
+          ClientRMProxy.createRMProxy(conf, ApplicationMasterProtocol.class);
     } catch (IOException e) {
       throw new YarnRuntimeException(e);
     }
@@ -182,8 +188,8 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
       throws YarnException, IOException {
     Preconditions.checkArgument(appHostName != null,
         "The host name should not be null");
-    Preconditions.checkArgument(appHostPort >= 0,
-        "Port number of the host should not be negative");
+    Preconditions.checkArgument(appHostPort >= -1, "Port number of the host"
+        + " should be any integers larger than or equal to -1");
     // do this only once ???
     RegisterApplicationMasterRequest request =
         RegisterApplicationMasterRequest.newInstance(appHostName, appHostPort,
@@ -199,9 +205,11 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
     Preconditions.checkArgument(progressIndicator >= 0,
         "Progress indicator should not be negative");
     AllocateResponse allocateResponse = null;
-    ArrayList<ResourceRequest> askList = null;
-    ArrayList<ContainerId> releaseList = null;
+    List<ResourceRequest> askList = null;
+    List<ContainerId> releaseList = null;
     AllocateRequest allocateRequest = null;
+    List<String> blacklistToAdd = new ArrayList<String>();
+    List<String> blacklistToRemove = new ArrayList<String>();
     
     try {
       synchronized (this) {
@@ -217,9 +225,22 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
         // optimistically clear this collection assuming no RPC failure
         ask.clear();
         release.clear();
+
+        blacklistToAdd.addAll(blacklistAdditions);
+        blacklistToRemove.addAll(blacklistRemovals);
+        
+        ResourceBlacklistRequest blacklistRequest = 
+            (blacklistToAdd != null) || (blacklistToRemove != null) ? 
+            ResourceBlacklistRequest.newInstance(blacklistToAdd,
+                blacklistToRemove) : null;
+        
         allocateRequest =
             AllocateRequest.newInstance(lastResponseId, progressIndicator,
-              askList, releaseList, null);
+              askList, releaseList, blacklistRequest);
+        // clear blacklistAdditions and blacklistRemovals before 
+        // unsynchronized part
+        blacklistAdditions.clear();
+        blacklistRemovals.clear();
       }
 
       allocateResponse = rmClient.allocate(allocateRequest);
@@ -253,6 +274,9 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
               ask.add(oldAsk);
             }
           }
+          
+          blacklistAdditions.addAll(blacklistToAdd);
+          blacklistRemovals.addAll(blacklistToRemove);
         }
       }
     }
@@ -278,11 +302,24 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
       String appMessage, String appTrackingUrl) throws YarnException,
       IOException {
     Preconditions.checkArgument(appStatus != null,
-        "AppStatus should not be null.");
+      "AppStatus should not be null.");
     FinishApplicationMasterRequest request =
         FinishApplicationMasterRequest.newInstance(appStatus, appMessage,
           appTrackingUrl);
-    rmClient.finishApplicationMaster(request);
+    try {
+      while (true) {
+        FinishApplicationMasterResponse response =
+            rmClient.finishApplicationMaster(request);
+        if (response.getIsUnregistered()) {
+          break;
+        }
+        LOG.info("Waiting for application to be successfully unregistered.");
+        Thread.sleep(100);
+      }
+    } catch (InterruptedException e) {
+      LOG.info("Interrupted while waiting for application"
+          + " to be removed from RMStateStore");
+    }
   }
   
   @Override
@@ -602,6 +639,33 @@ public class AMRMClientImpl<T extends ContainerRequest> extends AMRMClient<T> {
           + " resourceName=" + resourceName + " numContainers="
           + resourceRequestInfo.remoteRequest.getNumContainers() 
           + " #asks=" + ask.size());
+    }
+  }
+
+  @Override
+  public synchronized void updateBlacklist(List<String> blacklistAdditions,
+      List<String> blacklistRemovals) {
+    
+    if (blacklistAdditions != null) {
+      this.blacklistAdditions.addAll(blacklistAdditions);
+      // if some resources are also in blacklistRemovals updated before, we 
+      // should remove them here.
+      this.blacklistRemovals.removeAll(blacklistAdditions);
+    }
+    
+    if (blacklistRemovals != null) {
+      this.blacklistRemovals.addAll(blacklistRemovals);
+      // if some resources are in blacklistAdditions before, we should remove
+      // them here.
+      this.blacklistAdditions.removeAll(blacklistRemovals);
+    }
+    
+    if (blacklistAdditions != null && blacklistRemovals != null
+        && blacklistAdditions.removeAll(blacklistRemovals)) {
+      // we allow resources to appear in addition list and removal list in the
+      // same invocation of updateBlacklist(), but should get a warn here.
+      LOG.warn("The same resources appear in both blacklistAdditions and " +
+          "blacklistRemovals in updateBlacklist.");
     }
   }
 }

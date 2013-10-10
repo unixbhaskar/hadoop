@@ -713,6 +713,7 @@ public class Client {
                     }
                   });
             } catch (Exception ex) {
+              authMethod = saslRpcClient.getAuthMethod();
               if (rand == null) {
                 rand = new Random();
               }
@@ -736,12 +737,16 @@ public class Client {
           }
         
           if (doPing) {
-            this.in = new DataInputStream(new BufferedInputStream(
-                new PingInputStream(inStream)));
-          } else {
-            this.in = new DataInputStream(new BufferedInputStream(inStream));
+            inStream = new PingInputStream(inStream);
           }
-          this.out = new DataOutputStream(new BufferedOutputStream(outStream));
+          this.in = new DataInputStream(new BufferedInputStream(inStream));
+
+          // SASL may have already buffered the stream
+          if (!(outStream instanceof BufferedOutputStream)) {
+            outStream = new BufferedOutputStream(outStream);
+          }
+          this.out = new DataOutputStream(outStream);
+          
           writeConnectionContext(remoteId, authMethod);
 
           // update last activity time
@@ -1058,8 +1063,8 @@ public class Client {
         if (status == RpcStatusProto.SUCCESS) {
           Writable value = ReflectionUtils.newInstance(valueClass, conf);
           value.readFields(in);                 // read value
-          call.setRpcResponse(value);
           calls.remove(callId);
+          call.setRpcResponse(value);
           
           // verify that length was correct
           // only for ProtobufEngine where len can be verified easily
@@ -1093,8 +1098,8 @@ public class Client {
                   new RemoteException(exceptionClassName, errorMsg) :
               new RemoteException(exceptionClassName, errorMsg, erCode));
           if (status == RpcStatusProto.ERROR) {
-            call.setException(re);
             calls.remove(callId);
+            call.setException(re);
           } else if (status == RpcStatusProto.FATAL) {
             // Close the connection
             markClosed(re);
@@ -1161,8 +1166,8 @@ public class Client {
       Iterator<Entry<Integer, Call>> itor = calls.entrySet().iterator() ;
       while (itor.hasNext()) {
         Call c = itor.next().getValue(); 
+        itor.remove();
         c.setException(closeException); // local exception
-        itor.remove();         
       }
     }
   }

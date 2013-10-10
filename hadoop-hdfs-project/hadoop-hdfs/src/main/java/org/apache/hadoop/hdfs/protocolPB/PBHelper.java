@@ -30,6 +30,7 @@ import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
+import org.apache.hadoop.ha.proto.HAServiceProtocolProtos;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.ClientProtocol;
@@ -222,7 +223,8 @@ public class PBHelper {
   // DatanodeId
   public static DatanodeID convert(DatanodeIDProto dn) {
     return new DatanodeID(dn.getIpAddr(), dn.getHostName(), dn.getStorageID(),
-        dn.getXferPort(), dn.getInfoPort(), dn.getIpcPort());
+        dn.getXferPort(), dn.getInfoPort(), dn.hasInfoSecurePort() ? dn
+        .getInfoSecurePort() : 0, dn.getIpcPort());
   }
 
   public static DatanodeIDProto convert(DatanodeID dn) {
@@ -232,6 +234,7 @@ public class PBHelper {
         .setStorageID(dn.getStorageID())
         .setXferPort(dn.getXferPort())
         .setInfoPort(dn.getInfoPort())
+        .setInfoSecurePort(dn.getInfoSecurePort())
         .setIpcPort(dn.getIpcPort()).build();
   }
 
@@ -1311,10 +1314,10 @@ public class PBHelper {
       NNHAStatusHeartbeatProto.newBuilder();
     switch (hb.getState()) {
       case ACTIVE:
-        builder.setState(NNHAStatusHeartbeatProto.State.ACTIVE);
+        builder.setState(HAServiceProtocolProtos.HAServiceStateProto.ACTIVE);
         break;
       case STANDBY:
-        builder.setState(NNHAStatusHeartbeatProto.State.STANDBY);
+        builder.setState(HAServiceProtocolProtos.HAServiceStateProto.STANDBY);
         break;
       default:
         throw new IllegalArgumentException("Unexpected NNHAStatusHeartbeat.State:" +

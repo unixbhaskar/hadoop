@@ -18,15 +18,6 @@
 
 package org.apache.hadoop.hdfs.server.namenode;
 
-import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
-
-import java.io.IOException;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
@@ -36,6 +27,13 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoUnderConstruction;
 import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.junit.Test;
+
+import java.io.IOException;
+
+import static org.junit.Assert.fail;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
+import static org.mockito.Mockito.*;
 
 /**
  * Verify that TestCommitBlockSynchronization is idempotent.
@@ -166,6 +164,25 @@ public class TestCommitBlockSynchronization {
     doReturn(completedBlockInfo).when(namesystemSpy)
         .getStoredBlock(any(Block.class));
 
+    namesystemSpy.commitBlockSynchronization(
+        lastBlock, genStamp, length, true, false, newTargets, null);
+  }
+
+  @Test
+  public void testCommitBlockSynchronizationWithCloseAndNonExistantTarget()
+      throws IOException {
+    INodeFileUnderConstruction file = mock(INodeFileUnderConstruction.class);
+    Block block = new Block(blockId, length, genStamp);
+    FSNamesystem namesystemSpy = makeNameSystemSpy(block, file);
+    DatanodeID[] newTargets = new DatanodeID[]{
+        new DatanodeID("0.0.0.0", "nonexistantHost", "1", 0, 0, 0, 0)};
+
+    ExtendedBlock lastBlock = new ExtendedBlock();
+    namesystemSpy.commitBlockSynchronization(
+        lastBlock, genStamp, length, true,
+        false, newTargets, null);
+
+    // Repeat the call to make sure it returns true
     namesystemSpy.commitBlockSynchronization(
         lastBlock, genStamp, length, true, false, newTargets, null);
   }

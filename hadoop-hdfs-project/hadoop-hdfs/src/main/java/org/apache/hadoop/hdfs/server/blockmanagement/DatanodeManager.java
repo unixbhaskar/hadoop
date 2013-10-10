@@ -17,20 +17,9 @@
  */
 package org.apache.hadoop.hdfs.server.blockmanagement;
 
-import static org.apache.hadoop.util.Time.now;
-
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.List;
-import java.util.NavigableMap;
-import java.util.TreeMap;
-
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.net.InetAddresses;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
@@ -40,13 +29,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
-import org.apache.hadoop.hdfs.protocol.Block;
-import org.apache.hadoop.hdfs.protocol.DatanodeID;
-import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
-import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
+import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
-import org.apache.hadoop.hdfs.protocol.UnregisteredNodeException;
 import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor.BlockTargetPair;
 import org.apache.hadoop.hdfs.server.namenode.HostFileManager;
 import org.apache.hadoop.hdfs.server.namenode.HostFileManager.Entry;
@@ -54,33 +38,23 @@ import org.apache.hadoop.hdfs.server.namenode.HostFileManager.EntrySet;
 import org.apache.hadoop.hdfs.server.namenode.HostFileManager.MutableEntrySet;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.Namesystem;
-import org.apache.hadoop.hdfs.server.protocol.BalancerBandwidthCommand;
-import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
-import org.apache.hadoop.hdfs.server.protocol.BlockRecoveryCommand;
+import org.apache.hadoop.hdfs.server.protocol.*;
 import org.apache.hadoop.hdfs.server.protocol.BlockRecoveryCommand.RecoveringBlock;
-import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
-import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
-import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
-import org.apache.hadoop.hdfs.server.protocol.DisallowedDatanodeException;
-import org.apache.hadoop.hdfs.server.protocol.RegisterCommand;
 import org.apache.hadoop.hdfs.util.CyclicIteration;
-import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ipc.Server;
-import org.apache.hadoop.net.CachedDNSToSwitchMapping;
-import org.apache.hadoop.net.DNSToSwitchMapping;
-import org.apache.hadoop.net.NetUtils;
-import org.apache.hadoop.net.NetworkTopology;
+import org.apache.hadoop.net.*;
 import org.apache.hadoop.net.NetworkTopology.InvalidTopologyException;
-import org.apache.hadoop.net.Node;
-import org.apache.hadoop.net.NodeBase;
-import org.apache.hadoop.net.ScriptBasedMapping;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Time;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.net.InetAddresses;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+
+import static org.apache.hadoop.util.Time.now;
 
 /**
  * Manage datanodes, include decommission and other activities.
@@ -127,6 +101,8 @@ public class DatanodeManager {
   
   private final int defaultInfoPort;
 
+  private final int defaultInfoSecurePort;
+
   private final int defaultIpcPort;
 
   /** Read include/exclude files*/
@@ -165,6 +141,14 @@ public class DatanodeManager {
    * according to the NetworkTopology.
    */
   private boolean hasClusterEverBeenMultiRack = false;
+
+  /**
+   * The number of datanodes for each software version. This list should change
+   * during rolling upgrades.
+   * Software version -> Number of datanodes with this version
+   */
+  private HashMap<String, Integer> datanodesSoftwareVersions =
+    new HashMap<String, Integer>(4, 0.75f);
   
   DatanodeManager(final BlockManager blockManager, final Namesystem namesystem,
       final Configuration conf) throws IOException {
@@ -180,7 +164,10 @@ public class DatanodeManager {
               DFSConfigKeys.DFS_DATANODE_ADDRESS_DEFAULT)).getPort();
     this.defaultInfoPort = NetUtils.createSocketAddr(
           conf.get(DFSConfigKeys.DFS_DATANODE_HTTP_ADDRESS_KEY,
-              DFSConfigKeys.DFS_DATANODE_HTTPS_ADDRESS_DEFAULT)).getPort();
+              DFSConfigKeys.DFS_DATANODE_HTTP_ADDRESS_DEFAULT)).getPort();
+    this.defaultInfoSecurePort = NetUtils.createSocketAddr(
+        conf.get(DFSConfigKeys.DFS_DATANODE_HTTPS_ADDRESS_KEY,
+            DFSConfigKeys.DFS_DATANODE_HTTPS_ADDRESS_DEFAULT)).getPort();
     this.defaultIpcPort = NetUtils.createSocketAddr(
           conf.get(DFSConfigKeys.DFS_DATANODE_IPC_ADDRESS_KEY,
               DFSConfigKeys.DFS_DATANODE_IPC_ADDRESS_DEFAULT)).getPort();
@@ -456,6 +443,7 @@ public class DatanodeManager {
     heartbeatManager.removeDatanode(nodeInfo);
     blockManager.removeBlocksAssociatedTo(nodeInfo);
     networktopology.remove(nodeInfo);
+    decrementVersionCount(nodeInfo.getSoftwareVersion());
 
     if (LOG.isDebugEnabled()) {
       LOG.debug("remove datanode " + nodeInfo);
@@ -535,6 +523,61 @@ public class DatanodeManager {
       LOG.debug(getClass().getSimpleName() + ".wipeDatanode("
           + node + "): storage " + key 
           + " is removed from datanodeMap.");
+    }
+  }
+
+  private void incrementVersionCount(String version) {
+    if (version == null) {
+      return;
+    }
+    synchronized(datanodeMap) {
+      Integer count = this.datanodesSoftwareVersions.get(version);
+      count = count == null ? 1 : count + 1;
+      this.datanodesSoftwareVersions.put(version, count);
+    }
+  }
+
+  private void decrementVersionCount(String version) {
+    if (version == null) {
+      return;
+    }
+    synchronized(datanodeMap) {
+      Integer count = this.datanodesSoftwareVersions.get(version);
+      if(count != null) {
+        if(count > 1) {
+          this.datanodesSoftwareVersions.put(version, count-1);
+        } else {
+          this.datanodesSoftwareVersions.remove(version);
+        }
+      }
+    }
+  }
+
+  private boolean shouldCountVersion(DatanodeDescriptor node) {
+    return node.getSoftwareVersion() != null && node.isAlive &&
+      !isDatanodeDead(node);
+  }
+
+  private void countSoftwareVersions() {
+    synchronized(datanodeMap) {
+      HashMap<String, Integer> versionCount = new HashMap<String, Integer>();
+      for(DatanodeDescriptor dn: datanodeMap.values()) {
+        // Check isAlive too because right after removeDatanode(),
+        // isDatanodeDead() is still true 
+        if(shouldCountVersion(dn))
+        {
+          Integer num = versionCount.get(dn.getSoftwareVersion());
+          num = num == null ? 1 : num+1;
+          versionCount.put(dn.getSoftwareVersion(), num);
+        }
+      }
+      this.datanodesSoftwareVersions = versionCount;
+    }
+  }
+
+  public HashMap<String, Integer> getDatanodesSoftwareVersions() {
+    synchronized(datanodeMap) {
+      return new HashMap<String, Integer> (this.datanodesSoftwareVersions);
     }
   }
 
@@ -755,21 +798,28 @@ public class DatanodeManager {
         try {
           // update cluster map
           getNetworkTopology().remove(nodeS);
+          if(shouldCountVersion(nodeS)) {
+            decrementVersionCount(nodeS.getSoftwareVersion());
+          }
           nodeS.updateRegInfo(nodeReg);
+
+          nodeS.setSoftwareVersion(nodeReg.getSoftwareVersion());
           nodeS.setDisallowed(false); // Node is in the include list
-          
+
           // resolve network location
           nodeS.setNetworkLocation(resolveNetworkLocation(nodeS));
           getNetworkTopology().add(nodeS);
             
           // also treat the registration message as a heartbeat
           heartbeatManager.register(nodeS);
+          incrementVersionCount(nodeS.getSoftwareVersion());
           checkDecommissioning(nodeS);
           success = true;
         } finally {
           if (!success) {
             removeDatanode(nodeS);
             wipeDatanode(nodeS);
+            countSoftwareVersions();
           }
         }
         return;
@@ -793,6 +843,7 @@ public class DatanodeManager {
       try {
         nodeDescr.setNetworkLocation(resolveNetworkLocation(nodeDescr));
         networktopology.add(nodeDescr);
+        nodeDescr.setSoftwareVersion(nodeReg.getSoftwareVersion());
   
         // register new datanode
         addDatanode(nodeDescr);
@@ -803,17 +854,24 @@ public class DatanodeManager {
         // because its is done when the descriptor is created
         heartbeatManager.addDatanode(nodeDescr);
         success = true;
+        incrementVersionCount(nodeReg.getSoftwareVersion());
       } finally {
         if (!success) {
           removeDatanode(nodeDescr);
           wipeDatanode(nodeDescr);
+          countSoftwareVersions();
         }
       }
     } catch (InvalidTopologyException e) {
       // If the network location is invalid, clear the cached mappings
       // so that we have a chance to re-add this DataNode with the
       // correct network location later.
-      dnsToSwitchMapping.reloadCachedMappings();
+      List<String> invalidNodeNames = new ArrayList<String>(3);
+      // clear cache for nodes in IP or Hostname
+      invalidNodeNames.add(nodeReg.getIpAddr());
+      invalidNodeNames.add(nodeReg.getHostName());
+      invalidNodeNames.add(nodeReg.getPeerHostName());
+      dnsToSwitchMapping.reloadCachedMappings(invalidNodeNames);
       throw e;
     }
   }
@@ -828,6 +886,7 @@ public class DatanodeManager {
     namesystem.writeLock();
     try {
       refreshDatanodes();
+      countSoftwareVersions();
     } finally {
       namesystem.writeUnlock();
     }
@@ -1048,6 +1107,7 @@ public class DatanodeManager {
       // The IP:port is sufficient for listing in a report
       dnId = new DatanodeID(hostStr, "", "", port,
           DFSConfigKeys.DFS_DATANODE_HTTP_DEFAULT_PORT,
+          DFSConfigKeys.DFS_DATANODE_HTTPS_DEFAULT_PORT,
           DFSConfigKeys.DFS_DATANODE_IPC_DEFAULT_PORT);
     } else {
       String ipAddr = "";
@@ -1058,6 +1118,7 @@ public class DatanodeManager {
       }
       dnId = new DatanodeID(ipAddr, hostStr, "", port,
           DFSConfigKeys.DFS_DATANODE_HTTP_DEFAULT_PORT,
+          DFSConfigKeys.DFS_DATANODE_HTTPS_DEFAULT_PORT,
           DFSConfigKeys.DFS_DATANODE_IPC_DEFAULT_PORT);
     }
     return dnId;
@@ -1105,7 +1166,7 @@ public class DatanodeManager {
               new DatanodeDescriptor(new DatanodeID(entry.getIpAddress(),
                   entry.getPrefix(), "",
                   entry.getPort() == 0 ? defaultXferPort : entry.getPort(),
-                  defaultInfoPort, defaultIpcPort));
+                  defaultInfoPort, defaultInfoSecurePort, defaultIpcPort));
           dn.setLastUpdate(0); // Consider this node dead for reporting
           nodes.add(dn);
         }

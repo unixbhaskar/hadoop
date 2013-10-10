@@ -359,6 +359,7 @@ class ClusterJspHelper {
       nn.httpAddress = httpAddress;
       getLiveNodeCount(getProperty(props, "LiveNodes").getValueAsText(), nn);
       getDeadNodeCount(getProperty(props, "DeadNodes").getValueAsText(), nn);
+      nn.softwareVersion = getProperty(props, "SoftwareVersion").getTextValue();
       return nn;
     }
     
@@ -596,6 +597,7 @@ class ClusterJspHelper {
         toXmlItemBlockWithLink(doc, nn.deadDatanodeCount + " (" +
           nn.deadDecomCount + ")", nn.httpAddress+"/dfsnodelist.jsp?whatNodes=DEAD"
           , "Dead Datanode (Decommissioned)");
+        toXmlItemBlock(doc, "Software Version", nn.softwareVersion);
         doc.endTag(); // node
       }
       doc.endTag(); // namenodes
@@ -624,6 +626,7 @@ class ClusterJspHelper {
     int deadDatanodeCount = 0;
     int deadDecomCount = 0;
     String httpAddress = null;
+    String softwareVersion = "";
   }
 
   /**
@@ -824,7 +827,7 @@ class ClusterJspHelper {
     doc.startTag("item");
     doc.attribute("label", label);
     doc.attribute("value", value);
-    doc.attribute("link", HttpConfig.getSchemePrefix() + url);
+    doc.attribute("link", "///" + url);
     doc.endTag(); // item
   }
 
@@ -884,7 +887,16 @@ class ClusterJspHelper {
 
   private static String queryMbean(String httpAddress, Configuration conf) 
     throws IOException {
-    URL url = new URL(HttpConfig.getSchemePrefix() + httpAddress+JMX_QRY);
+    /**
+     * Although the other namenode might support HTTPS, it is fundamentally
+     * broken to get the JMX via an HTTPS connection inside the namenode,
+     * because in HTTPS set up the principal of the client and the one of
+     * the namenode differs. Therefore, there is no guarantees that the
+     * HTTPS connection can be set up.
+     *
+     * As a result, we just hard code the connection as an HTTP connection.
+     */
+    URL url = new URL("http://" + httpAddress + JMX_QRY);
     return readOutput(url);
   }
   /**

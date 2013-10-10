@@ -25,6 +25,8 @@ import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.proto.YarnProtos.URLProto;
 import org.apache.hadoop.yarn.proto.YarnProtos.URLProtoOrBuilder;
 
+import com.google.protobuf.TextFormat;
+
 @Private
 @Unstable
 public class URLPBImpl extends URL {
@@ -64,7 +66,7 @@ public class URLPBImpl extends URL {
 
   @Override
   public String toString() {
-    return getProto().toString().replaceAll("\\n", ", ").replaceAll("\\s+", " ");
+    return TextFormat.shortDebugString(getProto());
   }
 
   private void maybeInitBuilder() {
@@ -111,6 +113,26 @@ public class URLPBImpl extends URL {
     }
     builder.setScheme((scheme));
   }
+ 
+  @Override
+  public String getUserInfo() {
+    URLProtoOrBuilder p = viaProto ? proto : builder;
+    if (!p.hasUserInfo()) {
+      return null;
+    }
+    return (p.getUserInfo());
+  }
+
+  @Override
+  public void setUserInfo(String userInfo) {
+    maybeInitBuilder();
+    if (userInfo == null) { 
+      builder.clearUserInfo();
+      return;
+    }
+    builder.setUserInfo((userInfo));
+  }
+  
   @Override
   public String getHost() {
     URLProtoOrBuilder p = viaProto ? proto : builder;

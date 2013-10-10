@@ -28,6 +28,7 @@ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
+import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
@@ -128,10 +129,12 @@ public interface RMApp extends EventHandler<RMAppEvent> {
    *   <li>resource usage report - all values are -1</li>
    * </ul>
    *
+   * @param clientUserName the user name of the client requesting the report
    * @param allowAccess whether to allow full access to the report
    * @return the {@link ApplicationReport} detailing the status of the application.
    */
-  ApplicationReport createAndGetApplicationReport(boolean allowAccess);
+  ApplicationReport createAndGetApplicationReport(String clientUserName,
+      boolean allowAccess);
   
   /**
    * To receive the collection of all {@link RMNode}s whose updates have been
@@ -192,4 +195,20 @@ public interface RMApp extends EventHandler<RMAppEvent> {
    * @return the application type.
    */
   String getApplicationType(); 
+
+  /**
+   * Check whether this application is safe to unregister.
+   * An application is deemed to be safe to unregister if it is an unmanaged
+   * AM or its state has been removed from state store.
+   * @return the flag which indicates whether this application is safe to
+   *         unregister.
+   */
+  boolean isAppSafeToUnregister();
+
+  /**
+   * Create the external user-facing state of ApplicationMaster from the
+   * current state of the {@link RMApp}.
+   * @return the external user-facing state of ApplicationMaster.
+   */
+  YarnApplicationState createApplicationState();
 }

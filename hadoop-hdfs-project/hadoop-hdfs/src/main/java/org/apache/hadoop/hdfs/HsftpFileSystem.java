@@ -40,7 +40,6 @@ import javax.net.ssl.X509TrustManager;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdfs.web.URLUtils;
 import org.apache.hadoop.util.Time;
 
 /**
@@ -67,6 +66,14 @@ public class HsftpFileSystem extends HftpFileSystem {
   @Override
   public String getScheme() {
     return "hsftp";
+  }
+
+  /**
+   * Return the underlying protocol that is used to talk to the namenode.
+   */
+  @Override
+  protected String getUnderlyingProtocol() {
+    return "https";
   }
 
   @Override
@@ -135,26 +142,18 @@ public class HsftpFileSystem extends HftpFileSystem {
 
   @Override
   protected int getDefaultPort() {
-    return getDefaultSecurePort();
+    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_KEY,
+                            DFSConfigKeys.DFS_NAMENODE_HTTPS_PORT_DEFAULT);
   }
 
-  @Override
-  protected InetSocketAddress getNamenodeSecureAddr(URI uri) {
-    return getNamenodeAddr(uri);
-  }
-
-  @Override
-  protected URI getNamenodeUri(URI uri) {
-    return getNamenodeSecureUri(uri);
-  }
-  
   @Override
   protected HttpURLConnection openConnection(String path, String query)
       throws IOException {
     query = addDelegationTokenParam(query);
-    final URL url = new URL("https", nnUri.getHost(), 
+    final URL url = new URL(getUnderlyingProtocol(), nnUri.getHost(),
         nnUri.getPort(), path + '?' + query);
-    HttpsURLConnection conn = (HttpsURLConnection)URLUtils.openConnection(url);
+    HttpsURLConnection conn;
+    conn = (HttpsURLConnection)connectionFactory.openConnection(url);
     // bypass hostname verification
     conn.setHostnameVerifier(new DummyHostnameVerifier());
     conn.setRequestMethod("GET");

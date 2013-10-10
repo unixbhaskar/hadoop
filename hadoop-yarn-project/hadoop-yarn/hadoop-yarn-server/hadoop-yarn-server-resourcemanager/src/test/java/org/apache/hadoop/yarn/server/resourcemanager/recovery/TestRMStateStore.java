@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager.recovery;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -25,11 +26,13 @@ import static org.junit.Assert.fail;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import java.util.ArrayList;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+
+import javax.crypto.SecretKey;
 
 import junit.framework.Assert;
 
@@ -39,6 +42,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.ha.ClientBaseWithFixes;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.io.Text;
@@ -55,7 +59,6 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.Dispatcher;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
-import org.apache.hadoop.yarn.security.client.ClientToAMTokenIdentifier;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationAttemptState;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.RMStateStore.ApplicationState;
@@ -67,13 +70,17 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.event.RMAppAt
 import org.apache.hadoop.yarn.server.resourcemanager.security.AMRMTokenSecretManager;
 import org.apache.hadoop.yarn.server.resourcemanager.security.ClientToAMTokenSecretManagerInRM;
 import org.apache.hadoop.yarn.util.ConverterUtils;
+
+import org.apache.zookeeper.ZooKeeper;
+
 import org.junit.Test;
 
-public class TestRMStateStore {
+public class TestRMStateStore extends ClientBaseWithFixes{
 
   public static final Log LOG = LogFactory.getLog(TestRMStateStore.class);
 
-  class TestDispatcher implements Dispatcher, EventHandler<RMAppAttemptStoredEvent> {
+  static class TestDispatcher implements
+      Dispatcher, EventHandler<RMAppAttemptStoredEvent> {
 
     ApplicationAttemptId attemptId;
     Exception storedException;
@@ -82,7 +89,8 @@ public class TestRMStateStore {
 
     @SuppressWarnings("rawtypes")
     @Override
-    public void register(Class<? extends Enum> eventType, EventHandler handler) {
+    public void register(Class<? extends Enum> eventType,
+                         EventHandler handler) {
     }
 
     @Override
@@ -109,15 +117,58 @@ public class TestRMStateStore {
   }
 
   @Test
+  public void testZKRMStateStoreRealZK() throws Exception {
+    TestZKRMStateStoreTester zkTester = new TestZKRMStateStoreTester();
+    testRMAppStateStore(zkTester);
+    testRMDTSecretManagerStateStore(zkTester);
+  }
+
+  @Test
   public void testFSRMStateStore() throws Exception {
     HdfsConfiguration conf = new HdfsConfiguration();
-    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    MiniDFSCluster cluster =
+        new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
     try {
       TestFSRMStateStoreTester fsTester = new TestFSRMStateStoreTester(cluster);
       testRMAppStateStore(fsTester);
       testRMDTSecretManagerStateStore(fsTester);
     } finally {
       cluster.shutdown();
+    }
+  }
+
+  class TestZKRMStateStoreTester implements RMStateStoreHelper {
+    ZooKeeper client;
+    ZKRMStateStore store;
+
+    class TestZKRMStateStore extends ZKRMStateStore {
+      public TestZKRMStateStore(Configuration conf, String workingZnode)
+          throws Exception {
+        init(conf);
+        start();
+        assertTrue(znodeWorkingPath.equals(workingZnode));
+      }
+
+      @Override
+      public ZooKeeper getNewZooKeeper() throws IOException {
+        return client;
+      }
+    }
+
+    public RMStateStore getRMStateStore() throws Exception {
+      String workingZnode = "/Test";
+      YarnConfiguration conf = new YarnConfiguration();
+      conf.set(YarnConfiguration.ZK_RM_STATE_STORE_ADDRESS, hostPort);
+      conf.set(YarnConfiguration.ZK_RM_STATE_STORE_PARENT_PATH, workingZnode);
+      this.client = createClient();
+      this.store = new TestZKRMStateStore(conf, workingZnode);
+      return this.store;
+    }
+
+    @Override
+    public boolean isFinalStateValid() throws Exception {
+      List<String> nodes = client.getChildren(store.znodeWorkingPath, false);
+      return nodes.size() == 1;
     }
   }
 
@@ -129,7 +180,10 @@ public class TestRMStateStore {
     class TestFileSystemRMStore extends FileSystemRMStateStore {
       TestFileSystemRMStore(Configuration conf) throws Exception {
         init(conf);
+        Assert.assertNull(fs);
         assertTrue(workingDirPathURI.equals(fsWorkingPath));
+        start();
+        Assert.assertNotNull(fs);
       }
     }
 
@@ -146,7 +200,8 @@ public class TestRMStateStore {
     @Override
     public RMStateStore getRMStateStore() throws Exception {
       YarnConfiguration conf = new YarnConfiguration();
-      conf.set(YarnConfiguration.FS_RM_STATE_STORE_URI, workingDirPathURI.toString());
+      conf.set(YarnConfiguration.FS_RM_STATE_STORE_URI,
+          workingDirPathURI.toString());
       this.store = new TestFileSystemRMStore(conf);
       return store;
     }
@@ -155,11 +210,7 @@ public class TestRMStateStore {
     public boolean isFinalStateValid() throws Exception {
       FileSystem fs = cluster.getFileSystem();
       FileStatus[] files = fs.listStatus(workingDirPathURI);
-      if(files.length == 1) {
-        // only store root directory should exist
-        return true;
-      }
-      return false;
+      return files.length == 1;
     }
   }
 
@@ -180,9 +231,10 @@ public class TestRMStateStore {
     dispatcher.notified = false;
   }
 
-  void storeApp(RMStateStore store, ApplicationId appId, long time)
-                                                              throws Exception {
-    ApplicationSubmissionContext context = new ApplicationSubmissionContextPBImpl();
+  void storeApp(
+      RMStateStore store, ApplicationId appId, long time) throws Exception {
+    ApplicationSubmissionContext context =
+        new ApplicationSubmissionContextPBImpl();
     context.setApplicationId(appId);
 
     RMApp mockApp = mock(RMApp.class);
@@ -195,7 +247,7 @@ public class TestRMStateStore {
 
   ContainerId storeAttempt(RMStateStore store, ApplicationAttemptId attemptId,
       String containerIdStr, Token<AMRMTokenIdentifier> appToken,
-      Token<ClientToAMTokenIdentifier> clientToAMToken, TestDispatcher dispatcher)
+      SecretKey clientTokenMasterKey, TestDispatcher dispatcher)
       throws Exception {
 
     Container container = new ContainerPBImpl();
@@ -204,7 +256,8 @@ public class TestRMStateStore {
     when(mockAttempt.getAppAttemptId()).thenReturn(attemptId);
     when(mockAttempt.getMasterContainer()).thenReturn(container);
     when(mockAttempt.getAMRMToken()).thenReturn(appToken);
-    when(mockAttempt.getClientToAMToken()).thenReturn(clientToAMToken);
+    when(mockAttempt.getClientTokenMasterKey())
+        .thenReturn(clientTokenMasterKey);
     dispatcher.attemptId = attemptId;
     dispatcher.storedException = null;
     store.storeApplicationAttempt(mockAttempt);
@@ -212,13 +265,13 @@ public class TestRMStateStore {
     return container.getId();
   }
 
-  @SuppressWarnings("unchecked")
-  void testRMAppStateStore(RMStateStoreHelper stateStoreHelper) throws Exception {
+  void testRMAppStateStore(RMStateStoreHelper stateStoreHelper)
+      throws Exception {
     long submitTime = System.currentTimeMillis();
     Configuration conf = new YarnConfiguration();
     RMStateStore store = stateStoreHelper.getRMStateStore();
     TestDispatcher dispatcher = new TestDispatcher();
-    store.setDispatcher(dispatcher);
+    store.setRMDispatcher(dispatcher);
 
     AMRMTokenSecretManager appTokenMgr =
         new AMRMTokenSecretManager(conf);
@@ -230,33 +283,33 @@ public class TestRMStateStore {
     ApplicationId appId1 = attemptId1.getApplicationId();
     storeApp(store, appId1, submitTime);
 
-    // create application token1 for attempt1
-    List<Token<?>> appAttemptToken1 =
-        generateTokens(attemptId1, appTokenMgr, clientToAMTokenMgr, conf);
+    // create application token and client token key for attempt1
+    Token<AMRMTokenIdentifier> appAttemptToken1 =
+        generateAMRMToken(attemptId1, appTokenMgr);
     HashSet<Token<?>> attemptTokenSet1 = new HashSet<Token<?>>();
-    attemptTokenSet1.addAll(appAttemptToken1);
+    attemptTokenSet1.add(appAttemptToken1);
+    SecretKey clientTokenKey1 =
+        clientToAMTokenMgr.createMasterKey(attemptId1);
 
     ContainerId containerId1 = storeAttempt(store, attemptId1,
           "container_1352994193343_0001_01_000001",
-          (Token<AMRMTokenIdentifier>) (appAttemptToken1.get(0)),
-          (Token<ClientToAMTokenIdentifier>)(appAttemptToken1.get(1)),
-          dispatcher);
+          appAttemptToken1, clientTokenKey1, dispatcher);
 
     String appAttemptIdStr2 = "appattempt_1352994193343_0001_000002";
     ApplicationAttemptId attemptId2 =
         ConverterUtils.toApplicationAttemptId(appAttemptIdStr2);
 
-    // create application token2 for attempt2
-    List<Token<?>> appAttemptToken2 =
-        generateTokens(attemptId2, appTokenMgr, clientToAMTokenMgr, conf);
+    // create application token and client token key for attempt2
+    Token<AMRMTokenIdentifier> appAttemptToken2 =
+        generateAMRMToken(attemptId2, appTokenMgr);
     HashSet<Token<?>> attemptTokenSet2 = new HashSet<Token<?>>();
-    attemptTokenSet2.addAll(appAttemptToken2);
+    attemptTokenSet2.add(appAttemptToken2);
+    SecretKey clientTokenKey2 =
+        clientToAMTokenMgr.createMasterKey(attemptId2);
 
     ContainerId containerId2 = storeAttempt(store, attemptId2,
           "container_1352994193343_0001_02_000001",
-          (Token<AMRMTokenIdentifier>) (appAttemptToken2.get(0)),
-          (Token<ClientToAMTokenIdentifier>)(appAttemptToken2.get(1)),
-          dispatcher);
+          appAttemptToken2, clientTokenKey2, dispatcher);
 
     ApplicationAttemptId attemptIdRemoved = ConverterUtils
         .toApplicationAttemptId("appattempt_1352994193343_0002_000001");
@@ -268,7 +321,8 @@ public class TestRMStateStore {
     RMApp mockRemovedApp = mock(RMApp.class);
     HashMap<ApplicationAttemptId, RMAppAttempt> attempts =
                               new HashMap<ApplicationAttemptId, RMAppAttempt>();
-    ApplicationSubmissionContext context = new ApplicationSubmissionContextPBImpl();
+    ApplicationSubmissionContext context =
+        new ApplicationSubmissionContextPBImpl();
     context.setApplicationId(appIdRemoved);
     when(mockRemovedApp.getSubmitTime()).thenReturn(submitTime);
     when(mockRemovedApp.getApplicationSubmissionContext()).thenReturn(context);
@@ -285,7 +339,8 @@ public class TestRMStateStore {
     // load state
     store = stateStoreHelper.getRMStateStore();
     RMState state = store.loadState();
-    Map<ApplicationId, ApplicationState> rmAppState = state.getApplicationState();
+    Map<ApplicationId, ApplicationState> rmAppState =
+        state.getApplicationState();
 
     ApplicationState appState = rmAppState.get(appId1);
     // app is loaded
@@ -303,8 +358,12 @@ public class TestRMStateStore {
     assertEquals(containerId1, attemptState.getMasterContainer().getId());
     // attempt1 applicationToken is loaded correctly
     HashSet<Token<?>> savedTokens = new HashSet<Token<?>>();
-    savedTokens.addAll(attemptState.getAppAttemptTokens().getAllTokens());
+    savedTokens.addAll(attemptState.getAppAttemptCredentials().getAllTokens());
     assertEquals(attemptTokenSet1, savedTokens);
+    // attempt1 client token master key is loaded correctly
+    assertArrayEquals(clientTokenKey1.getEncoded(),
+        attemptState.getAppAttemptCredentials()
+        .getSecretKey(RMStateStore.AM_CLIENT_TOKEN_MASTER_KEY_NAME));
 
     attemptState = appState.getAttempt(attemptId2);
     // attempt2 is loaded correctly
@@ -314,8 +373,12 @@ public class TestRMStateStore {
     assertEquals(containerId2, attemptState.getMasterContainer().getId());
     // attempt2 applicationToken is loaded correctly
     savedTokens.clear();
-    savedTokens.addAll(attemptState.getAppAttemptTokens().getAllTokens());
+    savedTokens.addAll(attemptState.getAppAttemptCredentials().getAllTokens());
     assertEquals(attemptTokenSet2, savedTokens);
+    // attempt2 client token master key is loaded correctly
+    assertArrayEquals(clientTokenKey2.getEncoded(),
+        attemptState.getAppAttemptCredentials()
+        .getSecretKey(RMStateStore.AM_CLIENT_TOKEN_MASTER_KEY_NAME));
 
     // assert store is in expected state after everything is cleaned
     assertTrue(stateStoreHelper.isFinalStateValid());
@@ -327,7 +390,7 @@ public class TestRMStateStore {
       RMStateStoreHelper stateStoreHelper) throws Exception {
     RMStateStore store = stateStoreHelper.getRMStateStore();
     TestDispatcher dispatcher = new TestDispatcher();
-    store.setDispatcher(dispatcher);
+    store.setRMDispatcher(dispatcher);
 
     // store RM delegation token;
     RMDelegationTokenIdentifier dtId1 =
@@ -351,27 +414,18 @@ public class TestRMStateStore {
         store.loadState().getRMDTSecretManagerState();
     Assert.assertEquals(token1, secretManagerState.getTokenState());
     Assert.assertEquals(keySet, secretManagerState.getMasterKeyState());
-    Assert.assertEquals(sequenceNumber, secretManagerState.getDTSequenceNumber());
+    Assert.assertEquals(sequenceNumber,
+        secretManagerState.getDTSequenceNumber());
   }
 
-  private List<Token<?>> generateTokens(ApplicationAttemptId attemptId,
-      AMRMTokenSecretManager appTokenMgr,
-      ClientToAMTokenSecretManagerInRM clientToAMTokenMgr, Configuration conf) {
+  private Token<AMRMTokenIdentifier> generateAMRMToken(
+      ApplicationAttemptId attemptId,
+      AMRMTokenSecretManager appTokenMgr) {
     AMRMTokenIdentifier appTokenId =
         new AMRMTokenIdentifier(attemptId);
     Token<AMRMTokenIdentifier> appToken =
         new Token<AMRMTokenIdentifier>(appTokenId, appTokenMgr);
     appToken.setService(new Text("appToken service"));
-
-    ClientToAMTokenIdentifier clientToAMTokenId =
-        new ClientToAMTokenIdentifier(attemptId);
-    clientToAMTokenMgr.registerApplication(attemptId);
-    Token<ClientToAMTokenIdentifier> clientToAMToken =
-        new Token<ClientToAMTokenIdentifier>(clientToAMTokenId, clientToAMTokenMgr);
-    clientToAMToken.setService(new Text("clientToAMToken service"));
-    List<Token<?>> tokenPair = new ArrayList<Token<?>>();
-    tokenPair.add(0, appToken);
-    tokenPair.add(1, clientToAMToken);
-    return tokenPair;
+    return appToken;
   }
 }

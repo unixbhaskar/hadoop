@@ -75,6 +75,7 @@ import org.apache.hadoop.mapreduce.v2.app.job.Task;
 import org.apache.hadoop.mapreduce.v2.app.security.authorize.ClientHSPolicyProvider;
 import org.apache.hadoop.mapreduce.v2.hs.webapp.HsWebApp;
 import org.apache.hadoop.mapreduce.v2.jobhistory.JHAdminConfig;
+import org.apache.hadoop.mapreduce.v2.util.MRWebAppUtil;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
@@ -143,15 +144,19 @@ public class HistoryClientService extends AbstractService {
 
   private void initializeWebApp(Configuration conf) {
     webApp = new HsWebApp(history);
-    InetSocketAddress bindAddress = conf.getSocketAddr(
-        JHAdminConfig.MR_HISTORY_WEBAPP_ADDRESS,
-        JHAdminConfig.DEFAULT_MR_HISTORY_WEBAPP_ADDRESS,
-        JHAdminConfig.DEFAULT_MR_HISTORY_WEBAPP_PORT);
+    InetSocketAddress bindAddress = MRWebAppUtil.getJHSWebBindAddress(conf);
     // NOTE: there should be a .at(InetSocketAddress)
-    WebApps.$for("jobhistory", HistoryClientService.class, this, "ws")
-        .with(conf).at(NetUtils.getHostPortString(bindAddress)).start(webApp);
-    conf.updateConnectAddr(JHAdminConfig.MR_HISTORY_WEBAPP_ADDRESS,
-                           webApp.getListenerAddress());
+    WebApps
+        .$for("jobhistory", HistoryClientService.class, this, "ws")
+        .with(conf)
+        .withHttpSpnegoKeytabKey(
+            JHAdminConfig.MR_WEBAPP_SPNEGO_KEYTAB_FILE_KEY)
+        .withHttpSpnegoPrincipalKey(
+            JHAdminConfig.MR_WEBAPP_SPNEGO_USER_NAME_KEY)
+        .at(NetUtils.getHostPortString(bindAddress)).start(webApp);
+    
+    MRWebAppUtil.setJHSWebappURLWithoutScheme(conf,
+        NetUtils.getHostPortString(webApp.getListenerAddress()));
   }
 
   @Override

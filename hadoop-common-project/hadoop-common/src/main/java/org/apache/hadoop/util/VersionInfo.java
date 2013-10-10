@@ -48,6 +48,9 @@ public class VersionInfo {
     try {
       InputStream is = Thread.currentThread().getContextClassLoader()
         .getResourceAsStream(versionInfoFile);
+      if (is == null) {
+        throw new IOException("Resource not found");
+      }
       info.load(is);
     } catch (IOException ex) {
       LogFactory.getLog(getClass()).warn("Could not read '" + 
@@ -88,6 +91,10 @@ public class VersionInfo {
       " from " + _getRevision() +
       " by " + _getUser() +
       " source checksum " + _getSrcChecksum();
+  }
+
+  protected String _getProtocVersion() {
+    return info.getProperty("protocVersion", "Unknown");
   }
 
   private static VersionInfo COMMON_VERSION_INFO = new VersionInfo("common");
@@ -153,12 +160,20 @@ public class VersionInfo {
   public static String getBuildVersion(){
     return COMMON_VERSION_INFO._getBuildVersion();
   }
-  
+
+  /**
+   * Returns the protoc version used for the build.
+   */
+  public static String getProtocVersion(){
+    return COMMON_VERSION_INFO._getProtocVersion();
+  }
+
   public static void main(String[] args) {
     LOG.debug("version: "+ getVersion());
     System.out.println("Hadoop " + getVersion());
     System.out.println("Subversion " + getUrl() + " -r " + getRevision());
     System.out.println("Compiled by " + getUser() + " on " + getDate());
+    System.out.println("Compiled with protoc " + getProtocVersion());
     System.out.println("From source with checksum " + getSrcChecksum());
     System.out.println("This command was run using " + 
         ClassUtil.findContainingJar(VersionInfo.class));

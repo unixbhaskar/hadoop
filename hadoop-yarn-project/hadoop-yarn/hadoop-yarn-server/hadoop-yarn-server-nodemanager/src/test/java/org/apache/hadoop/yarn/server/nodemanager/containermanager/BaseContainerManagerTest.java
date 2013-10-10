@@ -20,8 +20,11 @@ package org.apache.hadoop.yarn.server.nodemanager.containermanager;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import junit.framework.Assert;
 
@@ -100,7 +103,7 @@ public abstract class BaseContainerManagerTest {
   protected static final int HTTP_PORT = 5412;
   protected Configuration conf = new YarnConfiguration();
   protected Context context = new NMContext(new NMContainerTokenSecretManager(
-    conf), new NMTokenSecretManagerInNM()) {
+    conf), new NMTokenSecretManagerInNM(), null, new ApplicationACLsManager(conf)) {
     public int getHttpPort() {
       return HTTP_PORT;
     };
@@ -163,6 +166,7 @@ public abstract class BaseContainerManagerTest {
     conf.set(YarnConfiguration.NM_LOG_DIRS, localLogDir.getAbsolutePath());
     conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogDir.getAbsolutePath());
 
+    conf.setLong(YarnConfiguration.NM_LOG_RETAIN_SECONDS, 1);
     // Default delSrvc
     delSrvc = createDeletionService();
     delSrvc.init(conf);
@@ -211,6 +215,16 @@ public abstract class BaseContainerManagerTest {
             NMTokenIdentifier nmTokenIdentifier) throws InvalidToken {
           // Do nothing
         }
+
+      @Override
+      public Map<String, ByteBuffer> getAuxServiceMetaData() {
+        Map<String, ByteBuffer> serviceData = new HashMap<String, ByteBuffer>();
+        serviceData.put("AuxService1",
+            ByteBuffer.wrap("AuxServiceMetaData1".getBytes()));
+        serviceData.put("AuxService2",
+            ByteBuffer.wrap("AuxServiceMetaData2".getBytes()));
+        return serviceData;
+      }
     };
   }
 
